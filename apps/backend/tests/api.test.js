@@ -1,6 +1,6 @@
 const request = require('supertest');
 const bcrypt = require('bcrypt');
-const { startServer, prisma, redis } = require('../index');
+const { startServer, stopServer, prisma, redis, pool } = require('../index');
 
 let appInstance;
 let serverInstance;
@@ -64,9 +64,10 @@ afterAll(async () => {
   if (testClient) await prisma.user.delete({ where: { id: testClient.id } }).catch(() => {});
   if (testStream) await prisma.stream.delete({ where: { id: testStream.id } }).catch(() => {});
   
-  await serverInstance.close();
+  await stopServer();
   await prisma.$disconnect();
   await redis.quit();
+  await pool.end();
 });
 
 describe('Authentication & Login Logic', () => {

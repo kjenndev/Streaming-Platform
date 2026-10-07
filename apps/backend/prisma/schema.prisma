@@ -24,6 +24,7 @@ model Stream {
   isDisabled          Boolean  @default(false)
   isRecordingEnabled  Boolean  @default(false)
   lastStartedAt       DateTime?
+  playbackVersion     Int      @default(0)
   isPasswordProtected Boolean  @default(false)
   password            String?
   restreamUrls        Json     @default("[]")

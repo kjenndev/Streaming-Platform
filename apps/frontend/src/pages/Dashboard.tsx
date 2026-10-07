@@ -1,4 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { mergeStats } from '../dashboardStats';
+import type { Stream, Recording, Restream, ChannelStats, LiveStats } from '../models';
+import type { Socket } from 'socket.io-client';
+import type { DataTableExpandedRows } from 'primereact/datatable';
+import { fetchPage } from '../pagination';
+import PagedItems from '../components/PagedItems';
+import { useState, useCallback, useEffectEvent, useEffect, useRef } from 'react';
 import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Button } from 'primereact/button';
@@ -41,20 +47,27 @@ ChartJS.register(
 
 const Dashboard = () => {
   const navigate = useNavigate();
-  const [streams, setStreams] = useState<any[]>([]);
-  const [liveStats, setLiveStats] = useState<any>({});
+  const [now, setNow] = useState(() => Date.now());
+  const [streamOffset, setStreamOffset] = useState(0);
+  const [nextOffset, setNextOffset] = useState<number | null>(null);
+  const [streamTotal, setStreamTotal] = useState(0);
+  const [recordingGeneration, setRecordingGeneration] = useState(0);
+  const [streams, setStreams] = useState<Stream[]>([]);
+  const [liveStats, setLiveStats] = useState<Record<string, ChannelStats>>({});
   const [totalRestreams, setTotalRestreams] = useState(0);
   const [showOffline, setShowOffline] = useState(true);
-  const [throughputHistory, setThroughputHistory] = useState<number[]>(new Array(30).fill(0));
+  const [telemetry, setTelemetry] = useState<LiveStats["telemetry"]>();
+  const [throughputHistory, setThroughputHistory] = useState<(number | null)[]>(new Array(30).fill(null));
   const [restreamThroughputHistory, setRestreamThroughputHistory] = useState<number[]>(new Array(30).fill(0));
-  const [cpuHistory, setCpuHistory] = useState<number[]>(new Array(30).fill(0));
-  const [expandedRows, setExpandedRows] = useState<any>(null);
+  const [cpuHistory, setCpuHistory] = useState<(number | null)[]>(new Array(30).fill(null));
+  const [expandedRows, setExpandedRows] = useState<DataTableExpandedRows | Stream[] | null>(null);
   const [displayInfoDialog, setDisplayInfoDialog] = useState(false);
   const [displayRecordingDialog, setDisplayRecordingDialog] = useState(false);
   const [displayRenameDialog, setDisplayRenameDialog] = useState(false);
-  const [selectedStream, setSelectedStream] = useState<any>(null);
-  const [selectedRecording, setSelectedRecording] = useState<any>(null);
+  const [selectedStream, setSelectedStream] = useState<Stream | null>(null);
+  const [selectedRecording, setSelectedRecording] = useState<Recording | null>(null);
   const [newRecordingTitle, setNewRecordingTitle] = useState('');
+  const [sort, setSort] = useState<'live-first' | 'name'>('live-first');
   const [globalFilter, setGlobalFilter] = useState<string>('');
   const [serverInfo, setServerInfo] = useState({ hostname: 'localhost', rtmpPort: 1935, mediaPort: 8000 });
   
@@ -66,7 +79,7 @@ const Dashboard = () => {
   if (rolesStr) {
     try {
       roles = JSON.parse(rolesStr);
-    } catch (e) {
+    } catch {
       roles = [];
     }
   }
@@ -81,108 +94,122 @@ const Dashboard = () => {
   const isAdmin = normalizedRoles.includes('ADMIN');
   const isClient = normalizedRoles.includes('CLIENT');
   
-  const socketRef = useRef<any>(null);
+  const socketRef = useRef<Socket | null>(null);
+  const invalidatePage = useRef<(() => void) | null>(null);
+  const streamRequest = useRef<AbortController | null>(null);
+
+  const fetchServerInfo = useCallback(async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/info`);
+      setServerInfo(response.data);
+    } catch {
+      console.error('Failed to fetch server info');
+    }
+  }, []);
+
+  const fetchStreams = useCallback(async (offset = streamOffset) => {
+    streamRequest.current?.abort();
+    const controller = new AbortController();
+    streamRequest.current = controller;
+    try {
+      const page = await fetchPage<Stream>(`${API_BASE_URL}/api/streams`, token, offset, controller.signal, { search: globalFilter, hideOffline: !showOffline, sort });
+      if (controller.signal.aborted) return;
+      const data = page.items;
+      setStreamOffset(offset);
+      setNextOffset(page.next);
+      setStreamTotal(page.total);
+      setStreams(data);
+      setNow(Date.now());
+    } catch {
+      if (controller.signal.aborted) return;
+      toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch streams', life: 3000 });
+    }
+  }, [token, streamOffset, globalFilter, showOffline, sort]);
+
+  const refreshStreams = useEffectEvent(() => { void fetchStreams(); });
+  useEffect(() => {
+    let active = true;
+    let poll: ReturnType<typeof setTimeout> | undefined;
+    let loading = false;
+    let dirty = false;
+    const load = async () => {
+      poll = undefined;
+      if (!active) return;
+      loading = true;
+      dirty = false;
+      await fetchStreams();
+      loading = false;
+      if (!active) return;
+      if (dirty) poll = setTimeout(load, 250);
+      else if (!isAdmin) poll = setTimeout(load, 5000);
+    };
+    invalidatePage.current = () => {
+      if (!active || !isAdmin || (showOffline && sort === 'name')) return;
+      dirty = true;
+      if (!loading && !poll) poll = setTimeout(load, 250);
+    };
+    void Promise.resolve().then(() => { if (active) { void load(); void fetchServerInfo(); } });
+    return () => { active = false; invalidatePage.current = null; clearTimeout(poll); streamRequest.current?.abort(); };
+  }, [fetchStreams, fetchServerInfo, isAdmin, showOffline, sort]);
 
   useEffect(() => {
-    fetchStreams();
-    fetchServerInfo();
     const socket = io(SOCKET_URL, {
       auth: { token }
     });
     socketRef.current = socket;
-    
-    socket.on('live_stats', (data) => {
+
+    let publishingSignature: string | undefined;
+    socket.on('live_stats', (data: LiveStats) => {
       if (!data) return;
       const stats = data.streams || {};
-      const system = data.system || { cpu: 0 };
-      
+      if (data.streams) {
+        // Admin snapshots cover the whole catalog, including rows off this page.
+        // Server live-first ordering is publishing status followed by name.
+        const signature = JSON.stringify(Object.keys(stats).filter(name => stats[name].isPublishing).sort());
+        if (signature !== publishingSignature) invalidatePage.current?.();
+        publishingSignature = signature;
+      }
+      const metrics = data.telemetry;
+      setTelemetry(metrics);
+
       setLiveStats(stats);
       setTotalRestreams(data.totalRestreams || 0);
-      
-      const totalThroughput = Object.values(stats).reduce((acc: number, curr: any) => acc + (curr.bitrate || 0), 0);
+
+      const totalThroughput = metrics?.media?.egressBitsPerSecond == null ? null : metrics.media.egressBitsPerSecond / 1000;
       setThroughputHistory(prev => [...prev.slice(1), totalThroughput]);
       setRestreamThroughputHistory(prev => [...prev.slice(1), data.totalRestreamThroughput || 0]);
-      setCpuHistory(prev => [...prev.slice(1), system.cpu || 0]);
+      setCpuHistory(prev => [...prev.slice(1), metrics?.api?.cpuPercent == null || metrics.media?.cpuPercent == null ? null : metrics.api.cpuPercent + metrics.media.cpuPercent]);
 
-      setStreams(prevStreams => {
-        const updated = (prevStreams || []).map(stream => {
-          if (stats[stream.channelName]) {
-            const channelStats = stats[stream.channelName];
-            return {
-              ...stream,
-              viewers: channelStats.viewers || 0,
-              isPublishing: !!channelStats.isPublishing,
-              startTime: channelStats.startTime || 0,
-              lastStartedAt: channelStats.lastStartedAt,
-              usernames: channelStats.usernames || []
-            };
-          }
-          return { ...stream, isPublishing: false, startTime: 0, usernames: [] };
-        });
-
-        // Advanced Sort:
-        // 1. Live status (DESC)
-        // 2. Start Time (DESC - newest first)
-        // 3. Channel Name (ASC - alphabetical)
-        return [...updated].sort((a, b) => {
-          if (a.isPublishing !== b.isPublishing) {
-            return b.isPublishing ? 1 : -1;
-          }
-          if (a.isPublishing && a.startTime !== b.startTime) {
-            return b.startTime - a.startTime;
-          }
-          return a.channelName.localeCompare(b.channelName);
-        });
-      });
+      setStreams(previous => mergeStats(previous, stats));
+      setNow(Date.now());
     });
 
-    socket.on('recording_saved', (data) => {
-      console.log('New recording saved:', data);
-      fetchStreams();
+    let recordingRefresh: ReturnType<typeof setTimeout> | undefined;
+    socket.on('recording_saved', () => {
+      if (recordingRefresh) return;
+      recordingRefresh = setTimeout(() => { recordingRefresh = undefined; setRecordingGeneration(v => v + 1); refreshStreams(); }, 500);
     });
-    
+
     return () => {
+      clearTimeout(recordingRefresh);
+      socket.removeAllListeners();
       socket.disconnect();
     };
-  }, []);
+  }, [token]);
 
-  const fetchServerInfo = async () => {
-    try {
-      const response = await axios.get(`${API_BASE_URL}/api/info`);
-      setServerInfo(response.data);
-    } catch (err) {
-      console.error('Failed to fetch server info');
-    }
-  };
 
-  const fetchStreams = async () => {
-    try {
-      const response = await axios.get(`${API_BASE_URL}/api/streams`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const data = response.data || [];
-      // Initial Sort: Live first, then alphabetical
-      const sorted = [...data].sort((a, b) => {
-        if (a.isPublishing !== b.isPublishing) {
-          return b.isPublishing ? 1 : -1;
-        }
-        return a.channelName.localeCompare(b.channelName);
-      });
-      setStreams(sorted);
-    } catch (err) {
-      toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch streams', life: 3000 });
-    }
-  };
+
+
 
   const openNew = () => {
     navigate('/dashboard/stream');
   };
 
-  const editStream = (stream: any) => {
+  const editStream = (stream: Stream) => {
     navigate(`/dashboard/stream/${stream.id}`);
   };
 
-  const showInfo = (stream: any) => {
+  const showInfo = (stream: Stream) => {
     setSelectedStream(stream);
     setDisplayInfoDialog(true);
   };
@@ -200,19 +227,19 @@ const Dashboard = () => {
           });
           toast.current?.show({ severity: 'success', summary: 'Deleted', detail: 'Channel deleted successfully', life: 3000 });
           fetchStreams();
-        } catch (err) {
+        } catch {
           toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to delete channel', life: 3000 });
         }
       }
     });
   };
 
-  const playRecording = (recording: any) => {
+  const playRecording = (recording: Recording) => {
     setSelectedRecording(recording);
     setDisplayRecordingDialog(true);
   };
 
-  const deleteRecording = async (recording: any) => {
+  const deleteRecording = async (recording: Recording) => {
     confirmDialog({
       message: 'Are you sure you want to PERMANENTLY delete this recording? This cannot be undone.',
       header: 'Delete Recording',
@@ -224,15 +251,16 @@ const Dashboard = () => {
             headers: { Authorization: `Bearer ${token}` }
           });
           toast.current?.show({ severity: 'success', summary: 'Deleted', detail: 'Recording removed', life: 3000 });
+          setRecordingGeneration(v => v + 1);
           fetchStreams();
-        } catch (err) {
+        } catch {
           toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to delete recording', life: 3000 });
         }
       }
     });
   };
 
-  const editRecording = (recording: any) => {
+  const editRecording = (recording: Recording) => {
     setSelectedRecording(recording);
     setNewRecordingTitle(recording.title || '');
     setDisplayRenameDialog(true);
@@ -240,20 +268,21 @@ const Dashboard = () => {
 
   const saveRecordingTitle = async () => {
     try {
-      await axios.put(`${API_BASE_URL}/api/recordings/${selectedRecording.id}`, {
+      await axios.put(`${API_BASE_URL}/api/recordings/${selectedRecording!.id}`, {
         title: newRecordingTitle
       }, {
         headers: { Authorization: `Bearer ${token}` }
       });
       toast.current?.show({ severity: 'success', summary: 'Updated', detail: 'Recording renamed', life: 2000 });
       setDisplayRenameDialog(false);
+      setRecordingGeneration(v => v + 1);
       fetchStreams();
-    } catch (err) {
+    } catch {
       toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to rename recording', life: 3000 });
     }
   };
 
-  const downloadRecording = async (recording: any) => {
+  const downloadRecording = async (recording: Recording) => {
     try {
       toast.current?.show({ severity: 'info', summary: 'Starting Download', detail: 'Preparing your file...', life: 2000 });
       
@@ -272,12 +301,12 @@ const Dashboard = () => {
       link.click();
       link.remove();
       window.URL.revokeObjectURL(url);
-    } catch (err) {
+    } catch {
       toast.current?.show({ severity: 'error', summary: 'Download Failed', detail: 'Could not download recording', life: 3000 });
     }
   };
 
-  const formatFileSize = (bytes: any) => {
+  const formatFileSize = (bytes: string | number) => {
     if (!bytes) return '0 B';
     const s = ['B', 'KB', 'MB', 'GB', 'TB'];
     const e = Math.floor(Math.log(Number(bytes)) / Math.log(1024));
@@ -297,28 +326,27 @@ const Dashboard = () => {
     });
   };
 
-  const rowExpansionTemplate = (data: any) => {
-    const users = data.usernames || [];
-    const recordings = data.recordings || [];
+  const rowExpansionTemplate = (data: Stream) => {
     
     return (
       <div className="p-2" style={{ backgroundColor: 'var(--base03)' }}>
         <TabView className="compact-tabs">
-          <TabPanel header={`Viewers (${users.length})`} leftIcon="pi pi-users mr-2">
+          <TabPanel header={`Viewers (${data.viewers || 0})`} leftIcon="pi pi-users mr-2">
+            <PagedItems<{ username: string }> url={`${API_BASE_URL}/api/streams/${data.id}/viewers`} token={token}>{users => (
             <div className="p-3">
               {users.length === 0 ? (
                 <div className="text-sm italic" style={{ color: 'var(--base01)' }}>No active viewers.</div>
               ) : (
                 <div className="flex flex-wrap gap-2">
-                  {users.map((user: string, i: number) => (
+                  {users.map((user, i: number) => (
                     <div key={i} className="flex align-items-center gap-3 p-2 border-round border-1" style={{ backgroundColor: 'var(--bg-highlight)', borderColor: 'var(--base01)' }}>
-                      <span className="text-sm font-bold" style={{ color: 'var(--blue)' }}>{user}</span>
+                      <span className="text-sm font-bold" style={{ color: 'var(--blue)' }}>{user.username}</span>
                       {isAdmin && (
                         <Button 
                           icon="pi pi-user-minus" 
                           className="p-button-danger p-button-sm p-button-text" 
                           tooltip="Kick User" 
-                          onClick={() => kickUser(data.channelName, user)} 
+                          onClick={() => kickUser(data.channelName, user.username)}
                         />
                       )}
                     </div>
@@ -326,14 +354,16 @@ const Dashboard = () => {
                 </div>
               )}
             </div>
+            )}</PagedItems>
           </TabPanel>
-          <TabPanel header={`Recordings (${recordings.length})`} leftIcon="pi pi-video mr-2">
+          <TabPanel header="Recordings" leftIcon="pi pi-video mr-2">
+            <PagedItems<Recording> generation={recordingGeneration} url={`${API_BASE_URL}/api/streams/${data.id}/recordings`} token={token}>{recordings => (
             <div className="p-3">
               {recordings.length === 0 ? (
                 <div className="text-sm italic" style={{ color: 'var(--base01)' }}>No recordings available.</div>
               ) : (
                 <div className="grid">
-                  {recordings.map((rec: any) => (
+                  {recordings.map((rec: Recording) => (
                     <div key={rec.id} className="col-12 md:col-6 lg:col-4">
                       <div 
                         className="p-3 border-round border-1" 
@@ -372,13 +402,14 @@ const Dashboard = () => {
                 </div>
               )}
             </div>
+            )}</PagedItems>
           </TabPanel>
         </TabView>
       </div>
     );
   };
 
-  const statusBody = (rowData: any) => {
+  const statusBody = (rowData: Stream) => {
     if (rowData.isDisabled) {
       return (
         <span style={{ color: 'var(--base01)', fontWeight: 'bold', fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '5px' }}>
@@ -404,7 +435,7 @@ const Dashboard = () => {
     );
   };
 
-  const watchersBody = (rowData: any) => {
+  const watchersBody = (rowData: Stream) => {
     const count = rowData.viewers || 0;
     return (
       <div className="flex align-items-center gap-2">
@@ -416,30 +447,30 @@ const Dashboard = () => {
 
   const formatDuration = (startTime: number) => {
     if (!startTime) return '00:00:00';
-    const seconds = Math.floor((Date.now() - startTime) / 1000);
+    const seconds = Math.floor((now - startTime) / 1000);
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
     return [h, m, s].map(v => v.toString().padStart(2, '0')).join(':');
   };
 
-  const onAirBody = (rowData: any) => {
+  const onAirBody = (rowData: Stream) => {
     if (!rowData.isPublishing || !rowData.startTime) return <span style={{ color: 'var(--base01)' }}>--:--:--</span>;
     return <span className="font-mono" style={{ color: 'var(--blue)' }}>{formatDuration(rowData.startTime)}</span>;
   };
 
-  const lastStartedBody = (rowData: any) => {
+  const lastStartedBody = (rowData: Stream) => {
     const time = rowData.lastStartedAt;
     if (!time) return <span style={{ color: 'var(--base01)' }}>Never</span>;
     return <span>{new Date(time).toLocaleString()}</span>;
   };
 
-  const restreamsBody = (rowData: any) => {
+  const restreamsBody = (rowData: Stream) => {
     const restreams = rowData.restreamUrls || {};
     if (typeof restreams !== 'object' || Array.isArray(restreams)) return <span>0</span>;
     
     // Count enabled restreams with necessary info
-    const count = Object.entries(restreams).filter(([platform, config]: [string, any]) => {
+    const count = Object.entries(restreams).filter(([platform, config]: [string, Restream]) => {
       const isEnabled = config.enabled === true;
       const hasKey = !!config.key?.trim();
       const hasUrl = platform === 'custom' ? !!config.url?.trim() : true; 
@@ -454,7 +485,7 @@ const Dashboard = () => {
     );
   };
 
-  const stopStream = (stream: any) => {
+  const stopStream = (stream: Stream) => {
     confirmDialog({
       message: `Are you sure you want to FORCE STOP the channel for ${stream.channelName}? This will disconnect the broadcaster immediately.`,
       header: 'Force Stop Channel',
@@ -467,7 +498,7 @@ const Dashboard = () => {
     });
   };
 
-  const toggleStreamEnabled = async (stream: any) => {
+  const toggleStreamEnabled = async (stream: Stream) => {
     try {
       const newState = !stream.isDisabled;
       await axios.put(`${API_BASE_URL}/api/streams/${stream.id}`, {
@@ -483,12 +514,12 @@ const Dashboard = () => {
         life: 3000 
       });
       fetchStreams();
-    } catch (err) {
+    } catch {
       toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to toggle channel status', life: 3000 });
     }
   };
 
-  const actionBody = (rowData: any) => {
+  const actionBody = (rowData: Stream) => {
     if (isClient) {
       const isOffline = !rowData.isPublishing || rowData.isDisabled;
       return (
@@ -569,7 +600,7 @@ const Dashboard = () => {
     labels: new Array(30).fill(''),
     datasets: [
       {
-        label: 'Throughput',
+        label: 'Media network egress (accepted Kbps)',
         data: throughputHistory,
         borderColor: '#268bd2',
         backgroundColor: 'rgba(38, 139, 210, 0.1)',
@@ -584,7 +615,7 @@ const Dashboard = () => {
     labels: new Array(30).fill(''),
     datasets: [
       {
-        label: 'Restream Throughput',
+        label: 'Estimated restream throughput',
         data: restreamThroughputHistory,
         borderColor: '#d33682',
         backgroundColor: 'rgba(211, 54, 130, 0.1)',
@@ -599,7 +630,7 @@ const Dashboard = () => {
     labels: new Array(30).fill(''),
     datasets: [
       {
-        label: 'CPU Load',
+        label: 'API + media core CPU',
         data: cpuHistory,
         borderColor: '#859900',
         backgroundColor: 'rgba(133, 153, 0, 0.1)',
@@ -643,8 +674,12 @@ const Dashboard = () => {
           )}
         </div>
         <div className="flex align-items-center gap-4">
+          <select aria-label="Sort channels" value={sort} onChange={e => { setStreamOffset(0); setExpandedRows(null); setSort(e.target.value as 'live-first' | 'name'); }}>
+            <option value="live-first">Live first</option>
+            <option value="name">Channel name</option>
+          </select>
           <div className="flex align-items-center gap-2">
-            <Checkbox inputId="showOffline" checked={showOffline} onChange={e => setShowOffline(e.checked || false)} />
+            <Checkbox inputId="showOffline" checked={showOffline} onChange={e => { setStreamOffset(0); setExpandedRows(null); setShowOffline(e.checked || false); }} />
             <label htmlFor="showOffline" className="text-sm font-bold" style={{ color: 'var(--text-h)' }}>Show Offline</label>
           </div>
           <span className="p-input-icon-left">
@@ -652,7 +687,7 @@ const Dashboard = () => {
             <InputText 
               type="search" 
               value={globalFilter} 
-              onChange={(e) => setGlobalFilter(e.target.value)} 
+              onChange={(e) => { setStreamOffset(0); setExpandedRows(null); setGlobalFilter(e.target.value); }}
               placeholder="Search Channels..." 
               className="p-inputtext-sm"
               style={{ 
@@ -669,6 +704,8 @@ const Dashboard = () => {
     );
   };
 
+  const metric = (value: number | undefined, divisor = 1) => value == null ? '—' : (value / divisor).toFixed(1);
+
   const rtmpIngestUrl = `rtmp://${serverInfo.hostname}:${serverInfo.rtmpPort}/live`;
   const webPlayerUrl = `${window.location.protocol}//${serverInfo.hostname}${window.location.port ? ':'+window.location.port : ''}/watch/${selectedStream?.channelName}`;
 
@@ -678,12 +715,12 @@ const Dashboard = () => {
       <Header />
       
       <div className="p-4">
-        {!isClient && (
-          <div className="grid m-0 px-3">
+        {isAdmin && (
+          <div className="grid m-0 px-2">
             <div className="col-12 md:col-2">
               <StatCard 
                 label="Active Channels" 
-                value={Object.values(liveStats || {}).filter((s: any) => s.isPublishing).length} 
+                value={Object.values(liveStats || {}).filter((s: ChannelStats) => s.isPublishing).length}
                 valueColor="var(--blue)" 
               />
             </div>
@@ -697,29 +734,29 @@ const Dashboard = () => {
             <div className="col-12 md:col-2">
               <StatCard 
                 label="Total Channels" 
-                value={streams?.length || 0} 
+                value={streamTotal}
               />
             </div>
             <div className="col-12 md:col-2">
               <StatCard 
-                label="Server CPU Load" 
-                chart={<Line data={cpuChartData} options={{...commonChartOptions, scales: {...commonChartOptions.scales, y: {...commonChartOptions.scales.y, max: 100, ticks: {...commonChartOptions.scales.y.ticks, callback: (v:any) => `${v}%`}}}}} />} 
-                chartValue={`${cpuHistory[cpuHistory.length - 1] || 0}%`}
+                label="API + Media CPU (100% = 1 core)"
+                chart={<Line data={cpuChartData} options={{...commonChartOptions, scales: {...commonChartOptions.scales, y: {...commonChartOptions.scales.y, ticks: {...commonChartOptions.scales.y.ticks, callback: (v: string | number) => `${v}%`}}}}} />}
+                chartValue={cpuHistory.at(-1) == null ? "Unavailable" : `${cpuHistory.at(-1)!.toFixed(1)}%`}
                 chartColor="var(--green)"
               />
             </div>
             <div className="col-12 md:col-2">
               <StatCard 
-                label="Ingress Throughput" 
-                chart={<Line data={throughputChartData} options={{...commonChartOptions, scales: {...commonChartOptions.scales, y: {...commonChartOptions.scales.y, ticks: {...commonChartOptions.scales.y.ticks, callback: (v:any) => `${v}k`}}}}} />} 
-                chartValue={`${throughputHistory[throughputHistory.length - 1] || 0} Kbps`}
+                label="Media network egress (accepted)"
+                chart={<Line data={throughputChartData} options={{...commonChartOptions, scales: {...commonChartOptions.scales, y: {...commonChartOptions.scales.y, ticks: {...commonChartOptions.scales.y.ticks, callback: (v: string | number) => `${v}k`}}}}} />}
+                chartValue={throughputHistory.at(-1) == null ? "Unavailable" : `${throughputHistory.at(-1)!.toFixed(1)} Kbps`}
                 chartColor="var(--blue)"
               />
             </div>
             <div className="col-12 md:col-2">
               <StatCard 
-                label="Restream Throughput" 
-                chart={<Line data={restreamThroughputChartData} options={{...commonChartOptions, scales: {...commonChartOptions.scales, y: {...commonChartOptions.scales.y, ticks: {...commonChartOptions.scales.y.ticks, callback: (v:any) => `${v}k`}}}}} />} 
+                label="Restream throughput (estimated)"
+                chart={<Line data={restreamThroughputChartData} options={{...commonChartOptions, scales: {...commonChartOptions.scales, y: {...commonChartOptions.scales.y, ticks: {...commonChartOptions.scales.y.ticks, callback: (v: string | number) => `${v}k`}}}}} />}
                 chartValue={`${restreamThroughputHistory[restreamThroughputHistory.length - 1] || 0} Kbps`}
                 chartColor="var(--magenta)"
               />
@@ -727,23 +764,34 @@ const Dashboard = () => {
           </div>
         )}
 
+        {isAdmin && <details className="mx-3 mt-3 text-sm border-1 border-round" style={{ borderColor: 'var(--base01)' }} aria-label="Process telemetry">
+          <summary className="p-3 font-medium" style={{ cursor: 'pointer', color: 'var(--text-h)' }}>Performance details</summary>
+          <div className="px-3 pb-3 flex flex-column gap-2">
+          <div>API RSS: {metric(telemetry?.api?.memory?.rss, 1048576)} MiB · Event loop p99: {metric(telemetry?.api?.eventLoop?.p99Ms)} ms · CPU: {metric(telemetry?.api?.cpuPercent)}%</div>
+          {telemetry?.media ? <>
+            <div>Media RSS: {metric(telemetry.media.memory?.rss, 1048576)} MiB · Event loop p99: {metric(telemetry.media.eventLoop?.p99Ms)} ms · CPU: {metric(telemetry.media.cpuPercent)}%</div>
+            <div>Slow disconnects: {telemetry.media.mediaSafety?.slowDisconnects ?? '—'} · Queues: {metric(telemetry.media.mediaSafety?.queuedBytes, 1048576)} MiB · reserved: {metric(telemetry.media.mediaSafety?.currentQueuedBytes, 1048576)} MiB · peak: {metric(telemetry.media.mediaSafety?.peakQueuedBytes, 1048576)} MiB</div>
+          </> : <div>Media telemetry unavailable</div>}
+          <small>CPU covers API and media Node processes, not FFmpeg; 100% is one core. Egress is accepted network bytes, not confirmed delivery. Queues exclude kernel buffers; reservations include pending writes. Restream throughput is estimated.</small>
+          </div>
+        </details>}
+
         <div className="mt-4 px-3">
           <DataTable 
-            value={streams.filter(s => showOffline || s.isPublishing)} 
+            value={streams}
             responsiveLayout="scroll" 
             className="shadow-none border-1" 
             style={{ borderColor: 'var(--base01)' }}
-            expandedRows={expandedRows}
+            expandedRows={expandedRows ?? undefined}
             onRowToggle={(e) => setExpandedRows(e.data)}
             rowExpansionTemplate={rowExpansionTemplate}
             dataKey="id"
             paginator 
             rows={5}
-            globalFilter={globalFilter}
             header={renderHeader()}
           >
             <Column expander style={{ width: '3em' }} headerStyle={{ backgroundColor: '#1f2937', border: 'none' }} bodyStyle={{ backgroundColor: 'var(--bg)' }} />
-            <Column field="channelName" header="Channel Name" sortable headerStyle={{ backgroundColor: '#1f2937', color: 'var(--text-h)', border: 'none' }} bodyStyle={{ backgroundColor: 'var(--bg)', color: 'var(--text)' }} />
+            <Column field="channelName" header="Channel Name" headerStyle={{ backgroundColor: '#1f2937', color: 'var(--text-h)', border: 'none' }} bodyStyle={{ backgroundColor: 'var(--bg)', color: 'var(--text)' }} />
             <Column header="Status" body={statusBody} headerStyle={{ backgroundColor: '#1f2937', color: 'var(--text-h)', border: 'none' }} bodyStyle={{ backgroundColor: 'var(--bg)' }} />
             <Column header="Watchers" body={watchersBody} headerStyle={{ backgroundColor: '#1f2937', color: 'var(--text-h)', border: 'none' }} bodyStyle={{ backgroundColor: 'var(--bg)' }} />
             <Column header="On Air" body={onAirBody} headerStyle={{ backgroundColor: '#1f2937', color: 'var(--text-h)', border: 'none' }} bodyStyle={{ backgroundColor: 'var(--bg)' }} />
@@ -751,6 +799,11 @@ const Dashboard = () => {
             <Column header="Restreams" body={restreamsBody} headerStyle={{ backgroundColor: '#1f2937', color: 'var(--text-h)', border: 'none' }} bodyStyle={{ backgroundColor: 'var(--bg)' }} />
             <Column header="" body={actionBody} headerStyle={{ backgroundColor: '#1f2937', color: 'var(--text-h)', textAlign: 'right', border: 'none' }} bodyStyle={{ backgroundColor: 'var(--bg)', textAlign: 'right' }} />
           </DataTable>
+          <div className="flex gap-2 p-2">
+            <Button label="Previous channels" disabled={streamOffset === 0} onClick={() => { setExpandedRows(null); setStreamOffset(Math.max(0, streamOffset - 50)); }} />
+            <span>{streamOffset + 1}–{streamOffset + streams.length} of {streamTotal}</span>
+            <Button label="Next channels" disabled={nextOffset === null} onClick={() => { setExpandedRows(null); setStreamOffset(nextOffset!); }} />
+          </div>
         </div>
       </div>
 
