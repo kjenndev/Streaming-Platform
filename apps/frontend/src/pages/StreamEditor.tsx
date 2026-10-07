@@ -1,4 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import type { Stream } from '../models';
+import { fetchStreamCatalog } from '../pagination';
+import React, { useState, useCallback, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Button } from 'primereact/button';
 import { InputText } from 'primereact/inputtext';
@@ -27,34 +29,28 @@ const INITIAL_STREAM_STATE = {
   restreamUrls: INITIAL_RESTREAM_STATE 
 };
 
-const StreamEditor = () => {
+const StreamEditorSession = () => {
   const { id } = useParams();
   const navigate = useNavigate();
-  const [streamForm, setStreamForm] = useState<any>(INITIAL_STREAM_STATE);
+  const [streamForm, setStreamForm] = useState<typeof INITIAL_STREAM_STATE & { streamKey?: string }>(INITIAL_STREAM_STATE);
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(false);
   const isEditMode = !!id;
   const token = localStorage.getItem('token');
   const toast = React.useRef<Toast>(null);
 
-  useEffect(() => {
-    if (isEditMode) {
-      fetchStream();
-    }
-  }, [id]);
-
-  const fetchStream = async () => {
+  const fetchStream = useCallback(async (signal: AbortSignal) => {
+    if (signal.aborted) return;
     setFetching(true);
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/streams`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const stream = response.data.find((s: any) => s.id === id);
+      const catalog = await fetchStreamCatalog<Stream>(`${API_BASE_URL}/api/streams`, token, signal);
+      if (signal.aborted) return;
+      const stream = catalog.find((s: { id: string }) => s.id === id);
       if (stream) {
-        let restreamData = { ...INITIAL_RESTREAM_STATE };
+        const restreamData = { ...INITIAL_RESTREAM_STATE };
         if (stream.restreamUrls && typeof stream.restreamUrls === 'object' && !Array.isArray(stream.restreamUrls)) {
           Object.keys(INITIAL_RESTREAM_STATE).forEach(platform => {
-            const val = stream.restreamUrls[platform];
+            const val = stream.restreamUrls?.[platform];
             if (typeof val === 'string') {
               restreamData[platform as keyof typeof INITIAL_RESTREAM_STATE] = { url: val, key: '', enabled: true };
             } else if (val && typeof val === 'object') {
@@ -66,14 +62,24 @@ const StreamEditor = () => {
             }
           });
         }
-        setStreamForm({ ...stream, restreamUrls: restreamData, isRecordingEnabled: !!stream.isRecordingEnabled });
+        setStreamForm({ ...INITIAL_STREAM_STATE, ...stream, isPasswordProtected: !!stream.isPasswordProtected, password: stream.password || '', restreamUrls: restreamData, isRecordingEnabled: !!stream.isRecordingEnabled });
       }
-    } catch (err) {
-      toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch channel details', life: 3000 });
+    } catch {
+      if (!signal.aborted) toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch channel details', life: 3000 });
     } finally {
-      setFetching(false);
+      if (!signal.aborted) setFetching(false);
     }
-  };
+  }, [id, token]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    if (isEditMode) {
+      void Promise.resolve().then(() => fetchStream(controller.signal));
+    }
+    return () => controller.abort();
+  }, [fetchStream, isEditMode]);
+
+
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -95,7 +101,7 @@ const StreamEditor = () => {
         toast.current?.show({ severity: 'success', summary: 'Created', detail: 'Channel created successfully', life: 3000 });
       }
       setTimeout(() => navigate('/dashboard'), 1000);
-    } catch (err) {
+    } catch {
       toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Error saving channel', life: 3000 });
     } finally {
       setLoading(false);
@@ -116,14 +122,14 @@ const StreamEditor = () => {
           });
           setStreamForm({ ...streamForm, streamKey: res.data.streamKey });
           toast.current?.show({ severity: 'success', summary: 'Regenerated', detail: 'New channel key generated', life: 3000 });
-        } catch (err) {
+        } catch {
           toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Error regenerating key', life: 3000 });
         }
       }
     });
   };
 
-  const updateRestreamField = (platform: string, field: string, value: any) => {
+  const updateRestreamField = (platform: keyof typeof INITIAL_RESTREAM_STATE, field: string, value: string | boolean) => {
     setStreamForm({
       ...streamForm,
       restreamUrls: {
@@ -136,7 +142,7 @@ const StreamEditor = () => {
     });
   };
 
-  const restreamPlatformInput = (platform: string, label: string, urlPlaceholder: string) => {
+  const restreamPlatformInput = (platform: keyof typeof INITIAL_RESTREAM_STATE, label: string, urlPlaceholder: string) => {
     const config = streamForm.restreamUrls[platform];
     const isEnabled = config.enabled !== false;
     const isCustom = platform === 'custom';
@@ -204,7 +210,7 @@ const StreamEditor = () => {
               </div>
               
               <div className="flex align-items-center gap-2">
-                <Checkbox inputId="isProtected" checked={!!streamForm.isPasswordProtected} onChange={e => setStreamForm({ ...streamForm, isPasswordProtected: e.checked })} />
+                <Checkbox inputId="isProtected" checked={!!streamForm.isPasswordProtected} onChange={e => setStreamForm({ ...streamForm, isPasswordProtected: !!e.checked })} />
                 <label htmlFor="isProtected" style={{ color: 'var(--text-h)' }}>Password Protected</label>
               </div>
               
@@ -268,4 +274,8 @@ const StreamEditor = () => {
   );
 };
 
+const StreamEditor = () => {
+  const { id } = useParams();
+  return <StreamEditorSession key={id || "new"} />;
+};
 export default StreamEditor;

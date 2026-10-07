@@ -25,8 +25,8 @@ const Login = () => {
       localStorage.setItem('username', response.data.username);
       localStorage.setItem('roles', JSON.stringify(response.data.roles || []));
       navigate('/dashboard');
-    } catch (err: any) {
-      setError(err.response?.data?.error || 'Login failed');
+    } catch (err: unknown) {
+      setError((axios.isAxiosError<{ error: string }>(err) ? err.response?.data?.error : undefined) || 'Login failed');
     } finally {
       setLoading(false);
     }

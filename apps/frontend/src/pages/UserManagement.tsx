@@ -1,4 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import { fetchStreamCatalog } from '../pagination';
+import type { Stream, User, StreamOption } from '../models';
+import type { DataTableExpandedRows } from 'primereact/datatable';
+import React, { useState, useCallback, useEffect } from 'react';
 import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Button } from 'primereact/button';
@@ -6,7 +9,6 @@ import { Dialog } from 'primereact/dialog';
 import { InputText } from 'primereact/inputtext';
 import { Password } from 'primereact/password';
 import { Message } from 'primereact/message';
-import { Dropdown } from 'primereact/dropdown';
 import { MultiSelect } from 'primereact/multiselect';
 import { Toast } from 'primereact/toast';
 import { confirmDialog } from 'primereact/confirmdialog';
@@ -16,11 +18,11 @@ import Header from '../components/Header';
 import { API_BASE_URL } from '../config';
 
 // Sub-component for the expanded row to safely use hooks
-const UserStreamPermissions = ({ user, availableStreams, onSave, token }: any) => {
-  const [selectedIds, setSelectedIds] = useState(user.authorizedStreams ? user.authorizedStreams.map((s: any) => s.id) : []);
+const UserStreamPermissions = ({ user, availableStreams, onSave }: { user: User; availableStreams: StreamOption[]; onSave: (user: User, ids: string[]) => void }) => {
+  const [selectedIds, setSelectedIds] = useState(user.authorizedStreams ? user.authorizedStreams.map((s: Stream) => s.id) : []);
 
   const toggleStream = (streamId: string) => {
-    let _selectedIds = [...selectedIds];
+    const _selectedIds = [...selectedIds];
     const index = _selectedIds.indexOf(streamId);
     if (index === -1)
       _selectedIds.push(streamId);
@@ -47,7 +49,7 @@ const UserStreamPermissions = ({ user, availableStreams, onSave, token }: any) =
             {availableStreams.length === 0 ? (
               <div className="italic text-sm" style={{ color: 'var(--base01)' }}>No streams configured.</div>
             ) : (
-              availableStreams.map((stream: any) => {
+              availableStreams.map((stream: StreamOption) => {
                 const isSelected = selectedIds.includes(stream.value);
                 return (
                   <div 
@@ -84,13 +86,13 @@ const UserStreamPermissions = ({ user, availableStreams, onSave, token }: any) =
 };
 
 const UserManagement = () => {
-  const [users, setUsers] = useState<any[]>([]);
-  const [availableStreams, setAvailableStreams] = useState<any[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [availableStreams, setAvailableStreams] = useState<StreamOption[]>([]);
   const [displayDialog, setDisplayDialog] = useState(false);
   const [isEditMode, setIsEditMode] = useState(false);
-  const [selectedUser, setSelectedUser] = useState<any>(null);
-  const [expandedRows, setExpandedRows] = useState<any>(null);
-  const [userForm, setUserForm] = useState<any>({ 
+  const [selectedUser, setSelectedUser] = useState<User | null>(null);
+  const [expandedRows, setExpandedRows] = useState<DataTableExpandedRows | User[] | null>(null);
+  const [userForm, setUserForm] = useState<{ username: string; password: string; roles: string[]; authorizedStreamIds: string[] }>({
     username: '', 
     password: '', 
     roles: ['STREAM_MANAGER'],
@@ -103,32 +105,34 @@ const UserManagement = () => {
   const token = localStorage.getItem('token');
   const navigate = useNavigate();
 
-  useEffect(() => {
-    fetchUsers();
-    fetchStreams();
-  }, []);
-
-  const fetchUsers = async () => {
+  const fetchUsers = useCallback(async () => {
     try {
       const response = await axios.get(`${API_BASE_URL}/api/users`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       setUsers(response.data);
-    } catch (err) {
+    } catch {
       toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch users', life: 3000 });
     }
-  };
+  }, [token]);
 
-  const fetchStreams = async () => {
+  const fetchStreams = useCallback(async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/streams`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setAvailableStreams(response.data.map((s: any) => ({ label: s.channelName, value: s.id })));
-    } catch (err) {
+      const catalog = await fetchStreamCatalog<Stream>(`${API_BASE_URL}/api/streams`, token);
+      setAvailableStreams(catalog.map((s: Stream) => ({ label: s.channelName, value: s.id })));
+    } catch {
       console.error('Failed to fetch streams');
     }
-  };
+  }, [token]);
+
+  useEffect(() => {
+    void Promise.resolve().then(() => fetchUsers());
+    void Promise.resolve().then(() => fetchStreams());
+  }, [fetchUsers, fetchStreams]);
+
+
+
+
 
   const openNew = () => {
     setUserForm({ username: '', password: '', roles: ['STREAM_MANAGER'], authorizedStreamIds: [] });
@@ -138,12 +142,12 @@ const UserManagement = () => {
     setDisplayDialog(true);
   };
 
-  const editUser = (user: any) => {
+  const editUser = (user: User) => {
     setUserForm({ 
       username: user.username, 
       password: '', 
       roles: user.roles || [],
-      authorizedStreamIds: user.authorizedStreams ? user.authorizedStreams.map((s: any) => s.id) : []
+      authorizedStreamIds: user.authorizedStreams ? user.authorizedStreams.map((s: Stream) => s.id) : []
     }); 
     setIsEditMode(true);
     setSelectedUser(user);
@@ -183,8 +187,8 @@ const UserManagement = () => {
       }
       setDisplayDialog(false);
       fetchUsers();
-    } catch (err: any) {
-      setError(err.response?.data?.error || 'Failed to save user');
+    } catch (err: unknown) {
+      setError((axios.isAxiosError<{ error: string }>(err) ? err.response?.data?.error : undefined) || 'Failed to save user');
     } finally {
       setLoading(false);
     }
@@ -203,14 +207,14 @@ const UserManagement = () => {
           });
           toast.current?.show({ severity: 'success', summary: 'Deleted', detail: 'User removed successfully', life: 3000 });
           fetchUsers();
-        } catch (err) {
+        } catch {
           toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to delete user', life: 3000 });
         }
       }
     });
   };
 
-  const updatePermissions = async (user: any, streamIds: string[]) => {
+  const updatePermissions = async (user: User, streamIds: string[]) => {
     try {
       await axios.put(`${API_BASE_URL}/api/users/${user.id}`, {
         ...user,
@@ -220,12 +224,12 @@ const UserManagement = () => {
       });
       toast.current?.show({ severity: 'success', summary: 'Saved', detail: 'Permissions updated', life: 2000 });
       fetchUsers();
-    } catch (err) {
+    } catch {
       toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to save permissions', life: 3000 });
     }
   };
 
-  const onRoleChange = (e: any) => {
+  const onRoleChange = (e: { value: string[] }) => {
     const selectedRoles = e.value;
     const lastSelected = selectedRoles[selectedRoles.length - 1];
 
@@ -239,7 +243,7 @@ const UserManagement = () => {
     }
   };
 
-  const actionBody = (rowData: any) => {
+  const actionBody = (rowData: User) => {
     const currentUsername = localStorage.getItem('username');
     return (
       <div className="flex justify-content-end pr-2 gap-2">
@@ -268,18 +272,17 @@ const UserManagement = () => {
     { label: 'Client', value: 'CLIENT' }
   ];
 
-  const rowExpansionTemplate = (data: any) => {
+  const rowExpansionTemplate = (data: User) => {
     return (
       <UserStreamPermissions 
         user={data} 
         availableStreams={availableStreams} 
         onSave={updatePermissions} 
-        token={token} 
       />
     );
   };
 
-  const authorizedStreamsBody = (rowData: any) => {
+  const authorizedStreamsBody = (rowData: User) => {
     if (rowData.roles && rowData.roles.includes('ADMIN')) return <span style={{ color: 'var(--green)' }}>Full Access</span>;
     const count = rowData.authorizedStreams ? rowData.authorizedStreams.length : 0;
     return <span>{count} Authorized Stream(s)</span>;
@@ -305,7 +308,7 @@ const UserManagement = () => {
             responsiveLayout="scroll" 
             className="shadow-none border-1" 
             style={{ borderColor: 'var(--base01)' }}
-            expandedRows={expandedRows}
+            expandedRows={expandedRows ?? undefined}
             onRowToggle={(e) => setExpandedRows(e.data)}
             rowExpansionTemplate={rowExpansionTemplate}
             dataKey="id"

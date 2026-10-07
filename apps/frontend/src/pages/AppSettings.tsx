@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import type { Setting, SecurityLog } from '../models';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Button } from 'primereact/button';
@@ -13,11 +14,11 @@ import Header from '../components/Header';
 import { API_BASE_URL, SOCKET_URL } from '../config';
 
 const AppSettings = () => {
-  const [settings, setSettings] = useState<any[]>([]);
-  const [logs, setLogs] = useState<any[]>([]);
+  const [settings, setSettings] = useState<Setting[]>([]);
+  const [logs, setLogs] = useState<SecurityLog[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const [displayDialog, setDisplayDialog] = useState(false);
-  const [selectedSetting, setSelectedStream] = useState<any>(null);
+  const [selectedSetting, setSelectedStream] = useState<Setting | null>(null);
   const [editForm, setEditForm] = useState({ value: '', description: '' });
   const [loading, setLoading] = useState(false);
   const [fetchingLogs, setFetchingLogs] = useState(false);
@@ -26,8 +27,33 @@ const AppSettings = () => {
   const navigate = useNavigate();
   const token = localStorage.getItem('token');
 
+  const fetchSettings = useCallback(async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/settings`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setSettings(response.data);
+    } catch {
+      toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch settings', life: 3000 });
+    }
+  }, [token]);
+
+  const fetchLogs = useCallback(async () => {
+    setFetchingLogs(true);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/logs`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setLogs(response.data || []);
+    } catch {
+      toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch security logs', life: 3000 });
+    } finally {
+      setFetchingLogs(false);
+    }
+  }, [token]);
+
   useEffect(() => {
-    fetchSettings();
+    void Promise.resolve().then(() => fetchSettings());
 
     const socket = io(SOCKET_URL, {
       auth: { token }
@@ -40,40 +66,19 @@ const AppSettings = () => {
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [fetchSettings, token]);
 
   useEffect(() => {
     if (activeIndex === 1) {
-      fetchLogs();
+      void Promise.resolve().then(() => fetchLogs());
     }
-  }, [activeIndex]);
+  }, [activeIndex, fetchLogs]);
 
-  const fetchSettings = async () => {
-    try {
-      const response = await axios.get(`${API_BASE_URL}/api/settings`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setSettings(response.data);
-    } catch (err) {
-      toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch settings', life: 3000 });
-    }
-  };
 
-  const fetchLogs = async () => {
-    setFetchingLogs(true);
-    try {
-      const response = await axios.get(`${API_BASE_URL}/api/logs`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setLogs(response.data || []);
-    } catch (err) {
-      toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to fetch security logs', life: 3000 });
-    } finally {
-      setFetchingLogs(false);
-    }
-  };
 
-  const editSetting = (setting: any) => {
+
+
+  const editSetting = (setting: Setting) => {
     setSelectedStream(setting);
     setEditForm({ value: setting.value, description: setting.description || '' });
     setDisplayDialog(true);
@@ -82,26 +87,26 @@ const AppSettings = () => {
   const saveSetting = async () => {
     setLoading(true);
     try {
-      await axios.put(`${API_BASE_URL}/api/settings/${selectedSetting.key}`, editForm, {
+      await axios.put(`${API_BASE_URL}/api/settings/${selectedSetting!.key}`, editForm, {
         headers: { Authorization: `Bearer ${token}` }
       });
       toast.current?.show({ severity: 'success', summary: 'Success', detail: 'Setting updated successfully', life: 3000 });
       setDisplayDialog(false);
       fetchSettings();
-    } catch (err) {
+    } catch {
       toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to update setting', life: 3000 });
     } finally {
       setLoading(false);
     }
   };
 
-  const actionBody = (rowData: any) => {
+  const actionBody = (rowData: Setting) => {
     return (
       <Button icon="pi pi-pencil" className="p-button-text p-button-sm" onClick={() => editSetting(rowData)} />
     );
   };
 
-  const eventBody = (rowData: any) => {
+  const eventBody = (rowData: SecurityLog) => {
     let color = 'var(--text)';
     const ev = (rowData.event || '').toUpperCase();
     if (ev.includes('FAILURE') || ev.includes('DELETED') || ev.includes('STOPPED') || ev.includes('KICKED')) color = 'var(--red)';

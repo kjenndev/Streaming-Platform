@@ -1,34 +1,84 @@
-import React, { useState, useEffect } from 'react';
+import type { Recording } from '../models';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import axios from 'axios';
 import { Card } from 'primereact/card';
+import { InputText } from 'primereact/inputtext';
 import { Button } from 'primereact/button';
 import StatusMessage from '../components/StatusMessage';
 import { API_BASE_URL } from '../config';
 
-const SharePlayer = () => {
+const SharePlayerSession = () => {
   const { id } = useParams();
-  const [recording, setRecording] = useState<any>(null);
+  const [recording, setRecording] = useState<Recording | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
-
-  useEffect(() => {
-    fetchRecording();
-  }, [id]);
-
-  const fetchRecording = async () => {
+  const [locked, setLocked] = useState(false);
+  const [password, setPassword] = useState('');
+  const [cap, setCap] = useState('');
+  const [unlocking, setUnlocking] = useState(false);
+  const [mediaCap, setMediaCap] = useState('');
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const resumeAt = useRef<number | null>(null);
+  const unlockRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => unlockRequest.current?.abort(), []);
+  const unlock = async () => {
+    unlockRequest.current?.abort();
+    const controller = new AbortController(); unlockRequest.current = controller;
+    setUnlocking(true);
     try {
-      const res = await axios.get(`${API_BASE_URL}/api/public/recordings/${id}`);
-      setRecording(res.data);
-    } catch (err) {
-      console.error('Recording not found');
-      setError(true);
-    } finally {
-      setLoading(false);
-    }
+      const result = await axios.post(`${API_BASE_URL}/api/public/recordings/${id}/playback`, { password }, { signal: controller.signal });
+      if (!controller.signal.aborted) { setCap(result.data.cap); setPassword(''); setLocked(false); setError(false); setLoading(true); }
+    } catch { if (!controller.signal.aborted) setError(true); }
+    finally { if (!controller.signal.aborted) setUnlocking(false); }
   };
 
-  const formatFileSize = (bytes: any) => {
+  const fetchRecording = useCallback(async (signal: AbortSignal) => {
+    if (signal.aborted) return;
+    try {
+      const token = localStorage.getItem('token');
+      const res = await axios.get(`${API_BASE_URL}/api/public/recordings/${id}${cap ? `?cap=${encodeURIComponent(cap)}` : ''}`, { signal, ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}) });
+      if (!signal.aborted) { setRecording(res.data); setMediaCap(cap || res.data.playbackCap || ''); setError(false); setLocked(false); }
+    } catch (failure) {
+      if (!signal.aborted) {
+        if ((failure as {response?:{status:number}})?.response?.status === 403) setLocked(true);
+        else setError(true);
+      }
+    } finally {
+      if (!signal.aborted) setLoading(false);
+    }
+  }, [id, cap]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void Promise.resolve().then(() => fetchRecording(controller.signal));
+    return () => controller.abort();
+  }, [fetchRecording]);
+
+
+
+  useEffect(() => {
+    if (!mediaCap || locked) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const expiry = setTimeout(() => { controller.abort(); setLocked(true); }, 120000);
+    const renew = () => {
+      void axios.post(`${API_BASE_URL}/api/public/recordings/${id}/playback`, { cap: mediaCap }, { signal: controller.signal, timeout: 10000 })
+        .then(result => {
+          if (controller.signal.aborted) return;
+          resumeAt.current = videoRef.current?.currentTime || 0;
+          setMediaCap(result.data.cap);
+        }).catch((failure: {response?:{status:number}}) => {
+          if (controller.signal.aborted) return;
+          if ([401, 403].includes(failure.response?.status || 0)) setLocked(true);
+          else timer = setTimeout(renew, 10000);
+        });
+    };
+    timer = setTimeout(renew, 60000);
+    return () => { clearTimeout(timer); clearTimeout(expiry); controller.abort(); };
+  }, [id, mediaCap, locked]);
+
+  const formatFileSize = (bytes: string | number) => {
     if (!bytes) return '0 B';
     const s = ['B', 'KB', 'MB', 'GB', 'TB'];
     const e = Math.floor(Math.log(Number(bytes)) / Math.log(1024));
@@ -36,6 +86,12 @@ const SharePlayer = () => {
   };
 
   if (loading) return <div className="p-4 text-white">Loading recording...</div>;
+
+  if (locked) return <Card title="Protected recording">
+    <InputText type="password" placeholder="Recording password" value={password} onChange={event => setPassword(event.target.value)} />
+    <Button label="Unlock recording" disabled={unlocking} onClick={() => { void unlock(); }} />
+    {error && <p>Unable to unlock this recording.</p>}
+  </Card>;
 
   if (error || !recording) {
     return (
@@ -50,7 +106,8 @@ const SharePlayer = () => {
     );
   }
 
-  const videoUrl = `${API_BASE_URL}${recording.filePath}`;
+  const credential = mediaCap;
+  const videoUrl = `${API_BASE_URL}${recording.filePath}${credential ? `?cap=${encodeURIComponent(credential)}` : ''}`;
   const title = recording.title || `Broadcast: ${new Date(recording.startedAt).toLocaleString()}`;
 
   return (
@@ -65,6 +122,9 @@ const SharePlayer = () => {
           <div className="flex flex-column gap-3">
             <div className="aspect-video" style={{ backgroundColor: '#000', borderRadius: '4px', overflow: 'hidden' }}>
               <video 
+                ref={videoRef}
+                onLoadedMetadata={() => { if (resumeAt.current !== null && videoRef.current) { videoRef.current.currentTime = resumeAt.current; resumeAt.current = null; } }}
+                onError={() => { if (mediaCap) setLocked(true); }}
                 src={videoUrl} 
                 controls 
                 autoPlay 
@@ -94,4 +154,8 @@ const SharePlayer = () => {
   );
 };
 
+const SharePlayer = () => {
+  const { id } = useParams();
+  return <SharePlayerSession key={id} />;
+};
 export default SharePlayer;

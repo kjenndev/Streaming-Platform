@@ -1,0 +1,21 @@
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { expect, it, vi } from 'vitest';
+import axios from 'axios';
+import PagedItems from '../components/PagedItems';
+vi.mock('axios');
+it('loads only the requested detail page, removes stale rows on error, and aborts on unmount', async () => {
+  vi.mocked(axios.get).mockResolvedValueOnce({ data: ['old'], headers: { 'x-next-offset': '50', 'x-total-count': '100' } });
+  const view = render(<PagedItems<string> url="/recordings" token="t">{items => items.map(item => <p key={item}>{item}</p>)}</PagedItems>);
+  expect(await screen.findByText('old')).toBeInTheDocument();
+  expect(axios.get).toHaveBeenCalledTimes(1);
+  vi.mocked(axios.get).mockRejectedValueOnce(new Error('offline'));
+  fireEvent.click(screen.getByText('Next'));
+  await screen.findByRole('alert');
+  expect(screen.queryByText('old')).not.toBeInTheDocument();
+  vi.mocked(axios.get).mockImplementationOnce(() => new Promise(() => {}));
+  fireEvent.click(screen.getByText('Refresh'));
+  await waitFor(() => expect(axios.get).toHaveBeenCalledTimes(3));
+  const signal = vi.mocked(axios.get).mock.calls.at(-1)![1]!.signal;
+  act(() => view.unmount());
+  expect(signal?.aborted).toBe(true);
+});

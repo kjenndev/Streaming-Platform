@@ -1,3 +1,4 @@
+import type { ReactElement } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
@@ -8,7 +9,7 @@ import SharePlayer from './pages/SharePlayer';
 import StreamEditor from './pages/StreamEditor';
 import { ConfirmDialog } from 'primereact/confirmdialog';
 
-const ProtectedRoute = ({ children }: { children: JSX.Element }) => {
+const ProtectedRoute = ({ children }: { children: ReactElement }) => {
   const token = localStorage.getItem('token');
   if (!token) {
     return <Navigate to="/login" replace />;

@@ -1,6 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
+import type { Stream, LiveStats } from '../models';
+import ChatMessages from '../components/ChatMessages';
+import { appendMessage, type ChatMessage } from '../chat';
+import { useState, useEffect, useRef } from 'react';
 import { useParams } from 'react-router-dom';
-import flvjs from 'flv.js';
+import { startLivePlayback } from '../livePlayback';
 import { Card } from 'primereact/card';
 import { InputText } from 'primereact/inputtext';
 import { Button } from 'primereact/button';
@@ -11,122 +14,161 @@ import EmojiPicker, { Theme } from 'emoji-picker-react';
 import StatusMessage from '../components/StatusMessage';
 import { API_BASE_URL, MEDIA_BASE_URL, SOCKET_URL } from '../config';
 
-const Player = () => {
+const PlayerSession = () => {
   const { channelName } = useParams();
-  const [stream, setStream] = useState<any>(null);
+  const [stream, setStream] = useState<Stream | null>(null);
+  const joinPassword = useRef('');
+  const playbackCap = useRef('');
+  const [joinUsername, setJoinUsername] = useState<string | null>(null);
   const [isAuthorized, setIsAuthorized] = useState(false);
   const [formData, setFormData] = useState({ username: '', password: '' });
   const [error, setError] = useState('');
   
-  const [messages, setMessages] = useState<any[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showChat, setShowChat] = useState(true);
   const [viewers, setViewers] = useState(0);
   
+  const [playbackSuspended, setPlaybackSuspended] = useState(false);
+  const playbackRef = useRef<ReturnType<typeof startLivePlayback> | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const flvPlayerRef = useRef<flvjs.Player | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const toast = useRef<Toast>(null);
 
   useEffect(() => {
-    fetchStreamInfo();
-    const socket = io(SOCKET_URL);
+    const controller = new AbortController();
+    void axios.get<Stream>(`${API_BASE_URL}/api/public/streams/${channelName}`, { signal: controller.signal })
+      .then(res => { if (!controller.signal.aborted) setStream(res.data); })
+      .catch(() => { if (!controller.signal.aborted) setError('Stream not found'); });
+    const token = localStorage.getItem('token');
+    const socket = io(SOCKET_URL, token ? { auth: { token } } : undefined);
     socketRef.current = socket;
 
-    socket.on('live_stats', (data) => {
-      const stats = data.streams;
-      if (channelName && stats[channelName]) {
-        const channelStats = stats[channelName];
-        setViewers(channelStats.viewers || 0);
-        
-        // Sync live status with real-time websocket data
-        setStream((prev: any) => {
-          if (prev && prev.isLive !== channelStats.isPublishing) {
-            if (!channelStats.isPublishing) {
-              // If stream just went offline, explicitly leave the channel
-              socketRef.current?.emit('leave_channel');
-              setIsAuthorized(false);
-              setMessages([]);
-            }
-            return { ...prev, isLive: channelStats.isPublishing };
-          }
-          return prev;
-        });
-      } else if (channelName) {
-        // If channel is missing from stats, assume it's offline
-        setStream((prev: any) => {
-          if (prev && prev.isLive) {
-            return { ...prev, isLive: false };
-          }
-          return prev;
-        });
-      }
-    });
-    
+    const receiveStats = (data: LiveStats) => {
+      const channelStats = channelName ? data.streams?.[channelName] : undefined;
+      // Channel-room packets are not global snapshots: absence is not offline.
+      if (!channelStats) return;
+      setViewers(channelStats.viewers || 0);
+      setStream(previous => previous && previous.isLive !== channelStats.isPublishing
+        ? { ...previous, isLive: !!channelStats.isPublishing } : previous);
+    };
+    socket.on('live_stats', receiveStats);
     return () => {
+      controller.abort();
+      socket.off('live_stats', receiveStats);
       socket.disconnect();
+      socketRef.current = null;
     };
   }, [channelName]);
 
   useEffect(() => {
     if (isAuthorized && videoRef.current && channelName && stream?.isLive) {
-      if (flvjs.isSupported()) {
-        const flvPlayer = flvjs.createPlayer({
-          type: 'flv',
-          url: `${MEDIA_BASE_URL}/live/${channelName}.flv`
-        });
-        flvPlayer.attachMediaElement(videoRef.current);
-        flvPlayer.load();
-        flvPlayer.play();
-        flvPlayerRef.current = flvPlayer;
-
-        return () => {
-          if (flvPlayerRef.current) {
-            flvPlayerRef.current.destroy();
-            flvPlayerRef.current = null;
-          }
-        };
-      }
+      const playback = startLivePlayback(videoRef.current, () => `${MEDIA_BASE_URL}/live/${channelName}.flv${playbackCap.current ? `?cap=${encodeURIComponent(playbackCap.current)}` : ''}`, setPlaybackSuspended);
+      playbackRef.current = playback;
+      return () => { playback(); playbackRef.current = null; };
     }
   }, [isAuthorized, channelName, stream?.isLive]);
 
   useEffect(() => {
-    if (isAuthorized && socketRef.current) {
-      const join = () => {
-        socketRef.current?.emit('join_channel', { channelName, username: formData.username });
-        console.log('Joined channel:', channelName);
+    const socket = socketRef.current;
+    if (joinUsername !== null && socket) {
+      let active = true;
+      let generation = 0;
+      let joined = false;
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      let renewal: ReturnType<typeof setTimeout> | undefined;
+      const renew = () => {
+        if (!active || !joined) return;
+        const request = generation;
+        renewal = setTimeout(expire, 10000);
+        socket.emit('renew_playback', {}, (response: {ok:boolean;cap?:string}) => {
+          if (!active || request !== generation || !joined) return;
+          if (!response?.ok || !response.cap) { expire(); return; }
+          playbackCap.current = response.cap;
+          clearTimeout(renewal);
+          renewal = setTimeout(renew, 60000);
+        });
       };
-
-      socketRef.current.on('connect', join);
-      
-      socketRef.current.on('kicked', () => {
+      const expire = () => {
+        generation++;
+        clearTimeout(renewal);
+        playbackCap.current = '';
+        joined = false;
+        setIsAuthorized(false);
+        setError('Joining timed out. Please try again.');
+        setJoinUsername(null);
+      };
+      const connectionFailed = () => {
+        expire();
+        clearTimeout(deadline);
+        setError('Connection failed. Please try again.');
+      };
+      const armDeadline = () => {
+        clearTimeout(deadline);
+        deadline = setTimeout(expire, 10000);
+      };
+      const disconnected = () => {
+        generation++;
+        clearTimeout(renewal);
+        playbackCap.current = '';
+        joined = false;
+        setIsAuthorized(false);
+        armDeadline();
+      };
+      const join = () => {
+        const request = ++generation;
+        armDeadline();
+        joined = false;
+        setIsAuthorized(false);
+        socket.emit('join_channel', { channelName, username: joinUsername, password: joinPassword.current }, (response: { ok: boolean; error?: string; cap?: string }) => {
+          if (!active || request !== generation || socketRef.current !== socket) return;
+          clearTimeout(deadline);
+          joined = response?.ok === true;
+          playbackCap.current = joined ? response.cap || '' : '';
+          clearTimeout(renewal);
+          if (joined && response.cap) renewal = setTimeout(renew, 60000);
+          setIsAuthorized(joined);
+          if (!joined) {
+            setError(response?.error || 'This username is already taken in this channel');
+            setJoinUsername(null);
+          } else {
+            setError('');
+            setPlaybackSuspended(false);
+          }
+        });
+      };
+      const kicked = () => {
         alert('You have been kicked from this stream by an administrator.');
         window.location.reload();
-      });
-
-      socketRef.current.on('receive_message', (msg) => {
-        setMessages((prev) => [...prev, msg]);
-      });
-      
-      join(); // Initial join
-
+      };
+      const receiveMessage = (msg: ChatMessage) => { if (joined) setMessages(previous => appendMessage(previous, msg)); };
+      socket.on('connect', join);
+      socket.on('connect_error', connectionFailed);
+      socket.on('disconnect', disconnected);
+      socket.on('kicked', kicked);
+      socket.on('receive_message', receiveMessage);
+      armDeadline();
+      if (socket.connected !== false) join();
+      else socket.connect();
       return () => {
-        socketRef.current?.off('connect', join);
-        socketRef.current?.off('kicked');
-        socketRef.current?.off('receive_message');
+        active = false;
+        clearTimeout(renewal);
+        playbackCap.current = '';
+        clearTimeout(deadline);
+        // Ordered before any retry on this socket: release even if its ack was lost.
+        // Stale acknowledgements must not leave a newer accepted membership.
+        socket.off('connect', join);
+        socket.off('connect_error', connectionFailed);
+        socket.off('disconnect', disconnected);
+        socket.off('kicked', kicked);
+        socket.off('receive_message', receiveMessage);
+        socket.emit('leave_channel');
       };
     }
-  }, [isAuthorized, channelName]);
+  }, [joinUsername, channelName]);
 
-  const fetchStreamInfo = async () => {
-    try {
-      const res = await axios.get(`${API_BASE_URL}/api/public/streams/${channelName}`);
-      setStream(res.data);
-    } catch (err) {
-      console.error('Stream not found');
-    }
-  };
+
 
   const handleJoin = () => {
     setError('');
@@ -136,19 +178,10 @@ const Player = () => {
       return;
     }
 
-    if (stream.isPasswordProtected && formData.password !== stream.password) {
-      setError('Incorrect password');
-      return;
-    }
+    joinPassword.current = formData.password;
 
-    // Check username availability via socket
-    socketRef.current?.emit('check_username', { channelName, username: formData.username }, (response: any) => {
-      if (response.available) {
-        setIsAuthorized(true);
-      } else {
-        setError('This username is already taken in this channel');
-      }
-    });
+    // The join acknowledgement, not an availability precheck, grants membership.
+    setJoinUsername(formData.username);
   };
 
   const sendMessage = () => {
@@ -163,7 +196,7 @@ const Player = () => {
     }
   };
 
-  const onEmojiClick = (emojiData: any) => {
+  const onEmojiClick = (emojiData: { emoji: string }) => {
     setNewMessage(prev => prev + emojiData.emoji);
   };
 
@@ -226,7 +259,7 @@ const Player = () => {
             )}
             
             {error && <small className="p-error" style={{ color: 'var(--red)' }}>{error}</small>}
-            <Button label="Join Stream" icon="pi pi-sign-in" onClick={handleJoin} className="mt-2" style={{ backgroundColor: 'var(--blue)', borderColor: 'var(--blue)' }} />
+            <Button label="Join Stream" disabled={joinUsername !== null} icon="pi pi-sign-in" onClick={handleJoin} className="mt-2" style={{ backgroundColor: 'var(--blue)', borderColor: 'var(--blue)' }} />
           </div>
         </Card>
       </div>
@@ -238,6 +271,7 @@ const Player = () => {
       <Toast ref={toast} />
       <div className="flex-grow-1 flex flex-column h-full relative overflow-hidden">
         <div className="flex-grow-1 flex align-items-center justify-content-center overflow-hidden" style={{ backgroundColor: '#001b23' }}>
+          {playbackSuspended && <Button label="Resume live" onClick={() => playbackRef.current?.resume()} />}
           <video 
             ref={videoRef} 
             controls 
@@ -275,20 +309,7 @@ const Player = () => {
             <span>Stream Chat</span>
             <span className="text-xs" style={{ color: 'var(--blue)' }}>@{formData.username}</span>
           </div>
-          <div className="flex-grow-1 overflow-y-auto p-3 flex flex-column gap-3" style={{ backgroundColor: 'var(--bg)' }}>
-            {messages.map((msg, i) => (
-              <div key={i} className="line-height-3 text-sm">
-                {msg.isSystem ? (
-                  <span className="italic" style={{ color: 'var(--base01)' }}>{msg.message}</span>
-                ) : (
-                  <>
-                    <span className={`font-bold mr-2`} style={{ color: msg.username === formData.username ? 'var(--green)' : 'var(--blue)' }}>{msg.username}</span>
-                    <span style={{ color: 'var(--text)' }}>{msg.message}</span>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
+          <ChatMessages messages={messages} username={formData.username} />
           <div className="border-top-1 flex align-items-center px-3 relative" style={{ height: '80px', backgroundColor: 'var(--bg-highlight)', borderColor: 'var(--base01)' }}>
             {showEmojiPicker && (
               <div className="absolute" style={{ bottom: '80px', right: '10px', zIndex: 1000 }}>
@@ -325,4 +346,8 @@ const Player = () => {
   );
 };
 
+const Player = () => {
+  const { channelName } = useParams();
+  return <PlayerSession key={channelName} />;
+};
 export default Player;

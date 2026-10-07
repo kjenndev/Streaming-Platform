@@ -2,7 +2,7 @@ import React from 'react';
 
 interface StatCardProps {
   label: string;
-  value: string | number;
+  value?: string | number;
   valueColor?: string;
   chart?: React.ReactNode;
   chartValue?: string | number;
@@ -40,7 +40,7 @@ const StatCard: React.FC<StatCardProps> = ({
           </div>
         ) : (
           <h2 className="text-primary m-0" style={{ color: valueColor, fontSize: '3.5rem' }}>
-            {value}
+            {value ?? '—'}
           </h2>
         )}
       </div>

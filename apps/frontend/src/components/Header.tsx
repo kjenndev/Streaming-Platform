@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { Button } from 'primereact/button';
 import { Menu } from 'primereact/menu';
 import { Dialog } from 'primereact/dialog';
@@ -26,7 +26,7 @@ const Header = () => {
   if (rolesStr) {
     try {
       roles = JSON.parse(rolesStr);
-    } catch (e) {
+    } catch {
       roles = [];
     }
   }
@@ -59,8 +59,8 @@ const Header = () => {
         setDisplayProfileDialog(false);
         window.location.reload();
       }, 1000);
-    } catch (err: any) {
-      setError(err.response?.data?.error || 'Failed to update profile');
+    } catch (err: unknown) {
+      setError((axios.isAxiosError<{ error: string }>(err) ? err.response?.data?.error : undefined) || 'Failed to update profile');
       toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Failed to update profile', life: 3000 });
     } finally {
       setLoading(false);
