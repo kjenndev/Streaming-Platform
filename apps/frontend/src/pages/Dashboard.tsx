@@ -716,8 +716,15 @@ const Dashboard = () => {
 
   const metric = (value: number | undefined, divisor = 1) => value == null ? '—' : (value / divisor).toFixed(1);
 
-  const rtmpIngestUrl = `rtmp://${serverInfo.hostname}:${serverInfo.rtmpPort}/live`;
-  const webPlayerUrl = `${window.location.protocol}//${serverInfo.hostname}${window.location.port ? ':'+window.location.port : ''}/watch/${selectedStream?.channelName}`;
+  // The seeded localhost setting is a development default, not a public address.
+  const ingestHostname = !serverInfo.hostname || serverInfo.hostname === 'localhost'
+    ? window.location.hostname : serverInfo.hostname;
+  const ingestAuthority = ingestHostname.includes(':') && !ingestHostname.startsWith('[')
+    ? `[${ingestHostname}]` : ingestHostname;
+  // Reuse the editor's explicit full ingest URL (including TLS, port and path).
+  const rtmpIngestUrl = import.meta.env.VITE_RTMP_INGEST || `rtmp://${ingestAuthority}:${serverInfo.rtmpPort}/live`;
+  // The player is served by the frontend, which may differ from the ingest host.
+  const webPlayerUrl = `${window.location.origin}/watch/${selectedStream?.channelName}`;
 
   return (
     <div className="min-h-screen" style={{ backgroundColor: 'var(--bg)' }}>
@@ -825,6 +832,7 @@ const Dashboard = () => {
               <label className="block font-bold mb-2" style={{ color: 'var(--text-h)' }}>OBS / Encoder Settings</label>
               <div className="flex flex-column gap-3">
                 <ConnectionInfoCard label="Server URL" value={rtmpIngestUrl} onCopy={copyToClipboard} />
+                <small>Ingest must be directly reachable on its own port. A proxied website hostname may not accept RTMP; configure server_hostname in App Settings or VITE_RTMP_INGEST before building.</small>
                 <ConnectionInfoCard label="Channel Key" value={`${selectedStream.channelName}?key=${selectedStream.streamKey}`} onCopy={copyToClipboard} />
               </div>
             </div>
