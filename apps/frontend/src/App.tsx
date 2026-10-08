@@ -1,5 +1,6 @@
-import type { ReactElement } from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { Fragment, useSyncExternalStore, type ReactElement } from 'react';
+import { sessionToken, subscribeSession, sessionExpired } from './session';
+import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import Player from './pages/Player';
@@ -10,11 +11,12 @@ import StreamEditor from './pages/StreamEditor';
 import { ConfirmDialog } from 'primereact/confirmdialog';
 
 const ProtectedRoute = ({ children }: { children: ReactElement }) => {
-  const token = localStorage.getItem('token');
+  const token = useSyncExternalStore(subscribeSession, sessionToken);
+  const location = useLocation();
   if (!token) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to="/login" replace state={{ returnTo: location.pathname + location.search + location.hash, reason: sessionExpired() ? 'session-expired' : undefined }} />;
   }
-  return children;
+  return <Fragment key={token}>{children}</Fragment>;
 };
 
 function App() {

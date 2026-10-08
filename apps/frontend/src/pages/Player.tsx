@@ -1,3 +1,4 @@
+import { expireSession } from '../session';
 import type { Stream, LiveStats } from '../models';
 import ChatMessages from '../components/ChatMessages';
 import { appendMessage, type ChatMessage } from '../chat';
@@ -45,6 +46,19 @@ const PlayerSession = () => {
     const socket = io(SOCKET_URL, token ? { auth: { token } } : undefined);
     socketRef.current = socket;
 
+    const invalidSession = () => {
+      expireSession(token);
+      // Public playback can be retried anonymously; never redirect capability failures.
+      socket.auth = {};
+      setError('Your sign-in session has expired. Join again as a viewer or sign in.');
+    };
+    socket.on('session_invalid', invalidSession);
+    const sessionConnectionError = (error: Error & { data?: { status?: number } }) => {
+      if (error.data?.status === 401) invalidSession();
+    };
+    socket.on('connect_error', sessionConnectionError);
+
+
     const receiveStats = (data: LiveStats) => {
       const channelStats = channelName ? data.streams?.[channelName] : undefined;
       // Channel-room packets are not global snapshots: absence is not offline.
@@ -57,6 +71,8 @@ const PlayerSession = () => {
     return () => {
       controller.abort();
       socket.off('live_stats', receiveStats);
+      socket.off('session_invalid', invalidSession);
+      socket.off('connect_error', sessionConnectionError);
       socket.disconnect();
       socketRef.current = null;
     };
@@ -99,10 +115,10 @@ const PlayerSession = () => {
         setError('Joining timed out. Please try again.');
         setJoinUsername(null);
       };
-      const connectionFailed = () => {
+      const connectionFailed = (error?: Error & { data?: { status?: number } }) => {
         expire();
         clearTimeout(deadline);
-        setError('Connection failed. Please try again.');
+        setError(error?.data?.status === 401 ? 'Your sign-in session has expired. Join again as a viewer or sign in.' : 'Connection failed. Please try again.');
       };
       const armDeadline = () => {
         clearTimeout(deadline);

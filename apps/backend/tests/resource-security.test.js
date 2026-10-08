@@ -57,7 +57,7 @@ test('revoked administrator role and deleted principals cannot mutate resources'
   expect((await request(runtime.app).put('/api/settings/absent').set(headers).send({value:'bad'})).status).toBe(403);
  }
  finally {await backend.prisma.user.update({where:{id:admin.id},data:{roles:['ADMIN']}});}
- expect((await request(runtime.app).put(`/api/streams/${other.id}`).set(auth({id:'nonexistent',roles:['ADMIN']})).send({isDisabled:false})).status).toBe(403);
+ expect((await request(runtime.app).put(`/api/streams/${other.id}`).set(auth({id:'nonexistent',roles:['ADMIN']})).send({isDisabled:false})).status).toBe(401);
 });
 test('public channel metadata is an explicit secret-free DTO and viewer password is checked server-side',async()=>{
  await backend.prisma.stream.update({where:{id:stream.id},data:{isPasswordProtected:true,password:'isolated-viewer-secret'}});
@@ -98,9 +98,9 @@ test('disabled (empty-role) and deleted accounts cannot use any authenticated ro
  const routes=[['get','/api/users'],['post','/api/users'],['put',`/api/users/${u.id}`],['delete',`/api/users/${stranger.id}`],['get','/api/streams'],['get','/api/settings'],['put','/api/settings/missing'],['get','/api/metrics'],['get','/api/logs'],['put','/api/profile'],['get',`/api/streams/${stream.id}/viewers`],['get',`/api/streams/${stream.id}/recordings`],['put',`/api/streams/${stream.id}`],['post','/api/streams'],['delete',`/api/streams/${stream.id}`],['get',`/api/recordings/${recording.id}/download`],['put',`/api/recordings/${recording.id}`],['delete',`/api/recordings/${recording.id}`]];
  try{
   await backend.prisma.user.update({where:{id:u.id},data:{roles:[]}});
-  for(const [method,url] of routes)expect((await request(runtime.app)[method](url).set(headers).send({roles:['ADMIN']})).status).toBe(403);
+  for(const [method,url] of routes)expect((await request(runtime.app)[method](url).set(headers).send({roles:['ADMIN']})).status).toBe(401);
   await backend.prisma.user.delete({where:{id:u.id}});
-  for(const [method,url] of routes)expect((await request(runtime.app)[method](url).set(headers).send({roles:['ADMIN']})).status).toBe(403);
+  for(const [method,url] of routes)expect((await request(runtime.app)[method](url).set(headers).send({roles:['ADMIN']})).status).toBe(401);
  }finally{await backend.prisma.user.deleteMany({where:{id:u.id}});}
 });
 test('persistent socket administrator loses dashboard and kick privilege after downgrade',async()=>{

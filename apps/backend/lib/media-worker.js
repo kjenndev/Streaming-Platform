@@ -55,7 +55,12 @@ for(const file of ['rtmp_session','flv_session']){
  };
 }
 const NodeMediaServer=require('node-media-server');
-const RecordSession=require('node-media-server/src/session/record_session');
+const BaseRecordSession=require('node-media-server/src/session/record_session');
+class RecordSession extends BaseRecordSession {
+ createWriteStreamWithDirsSync(filepath){return require('fs').createWriteStream(filepath,{flags:'wx',mode:0o600});}
+}
+const recovery=require('./recording-recovery').createRecordingRecovery({root:process.env.RECORDINGS_ROOT || path.join(__dirname,'../recordings'),prisma});
+let recoveryCollector;
 async function published(session){
  const stream=session.authorizedStream;if(!stream || stopping) return;
  const channel=stream.channelName, startTime=Date.now();
@@ -70,13 +75,11 @@ async function published(session){
  send({type:'invalidate',channel});
  if(session.socket.destroyed || stopping) return;
  if(stream.isRecordingEnabled){
-  const filename=`${Date.now()}_${require('crypto').randomBytes(4).toString('hex')}.flv`;
-  const filepath=path.join(process.env.RECORDINGS_ROOT || path.join(__dirname,'../recordings'),'live',channel,filename);
-  await fs.mkdir(path.dirname(filepath),{recursive:true});
-  if(session.socket.destroyed || stopping) return;
-  const record=new RecordSession(session,filepath);
+  const intent=await recovery.begin(stream,startTime);
+  if(session.socket.destroyed || stopping)return;
+  const record=new RecordSession(session,intent.filepath);
   const closed=new Promise(resolve=>record.fileStream.once('close',resolve));
-  recordings.set(session.id,{record,closed,filepath,streamId:stream.id,channel,startTime});record.run();
+  recordings.set(session.id,{record,closed,...intent});record.run();
  }
  const ffmpeg=await setting('ffmpeg_path','/usr/bin/ffmpeg');
  const active=[];relays.set(session.id,active);
@@ -93,13 +96,7 @@ async function published(session){
 async function finalize(item){
  await item.closed;
  if(item.record.recordingError) {console.error('[media] recording transport failed; source retained');return;}
- const output=item.filepath.replace(/\.flv$/,'.mp4');
- const command=await setting('ffmpeg_path','/usr/bin/ffmpeg');
- const conversion=children.run(command,['-nostdin','-hide_banner','-loglevel','error','-i',item.filepath,'-c','copy','-movflags','+faststart',output]);
- if(await conversion.done!==0) throw new Error('Recording conversion failed');
- const stat=await fs.stat(output),endedAt=new Date();
- await prisma.recording.create({data:{streamId:item.streamId,fileName:path.basename(output),filePath:`/recordings/live/${item.channel}/${path.basename(output)}`,fileSize:BigInt(stat.size),startedAt:new Date(item.startTime),endedAt,duration:Math.round((endedAt.getTime()-item.startTime)/1000)}});
- await fs.unlink(item.filepath);send({type:'recording_saved',channelName:item.channel,fileName:path.basename(output)});
+ if(await recovery.finish(item.id,{owned:true}))send({type:'recording_saved',channelName:item.channel,fileName:'video.mp4'});
 }
 async function ended(session){
  // Serialize behind startup for this publisher: disconnect can happen during DB I/O.
@@ -152,13 +149,13 @@ async function shutdown(){
  // Bound shutdown even if a conversion or database operation never completes.
  // The source FLV is retained unless conversion and metadata persistence succeed.
  const deadline=setTimeout(()=>{children.stop(0).finally(()=>process.exit(1));},25000);
- await Promise.all([collector?.stop(),playbackCollector?.stop()]);
+ await Promise.all([collector?.stop(),playbackCollector?.stop(),recoveryCollector?.stop()]);
  for(const session of [...context.sessions.values()]) session.close();
  for(const item of recordings.values()) item.record.close();
  const servers=[nms?.httpServer.httpServer,nms?.rtmpServer.tcpServer].filter(Boolean);
  await Promise.all(servers.map(s=>new Promise(r=>s.close(r))));
  await Promise.allSettled([...tasks]);
- await children.stop();telemetry.close();
+ await children.stop();await recovery.close();telemetry.close();
  await redis.del('live_streams');await prisma.stream.updateMany({where:{isLive:true},data:{isLive:false}});
  await redis.quit();await prisma.$disconnect();await pool.end();clearTimeout(deadline);
  process.exit(0);
@@ -183,4 +180,8 @@ process.on('disconnect',onShutdown);process.on('SIGTERM',onShutdown);process.on(
  const ready=Promise.all([nms.httpServer.httpServer,nms.rtmpServer.tcpServer].map(s=>new Promise((resolve,reject)=>{s.once('listening',resolve);s.once('error',reject);})));nms.run();await ready;
  playbackCollector=serialCollector(revalidatePlayback,2000,error=>console.error('[media] authorization sweep failed:',error.name));
  collector=serialCollector(snapshot,2000,error=>console.error('[media] stats failed:',error.name));await snapshot();send({type:'ready'});
+ // Orphan probing/conversion must not consume the supervisor startup deadline.
+ // The serial collector bounds overlap and shutdown still drains its active sweep.
+ recoveryCollector=serialCollector(()=>recovery.recover(),30000,()=>console.error('[media] recording recovery deferred'));
+ void recoveryCollector.tick();
 })().catch(error=>{console.error('[media] startup failed:',error.code || error.name);process.exit(1);});

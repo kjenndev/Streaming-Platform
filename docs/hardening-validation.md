@@ -1,6 +1,10 @@
 # Hardening validation
 
-## Current development checkpoint — 2026-10-07
+## Stability follow-up candidate
+
+The first session/login-limit stability slice is implemented and tested on `feature/streaming-stability` from merged main `463b88c`. See [session and login-limit stability](stability-auth.md) for the new 401/403/5xx contract, socket expiration, frontend recovery, limiter correction and exact validation scope. It is **not deployed or independently approved**. Recovery/operational work and independent security verification remain open. The previous checkpoint below is historical; its expired-session and successful-login charging caveats are addressed in this candidate, not yet in the running user services.
+
+## Merged development checkpoint — 2026-10-07
 
 Branch: `feature/streaming-performance-hardening`. This is a **DEVELOPMENT CHECKPOINT**, not production-readiness or independent security approval. The latest independent security review is incomplete because of a provider filter; it did not pass. The user authorized committing and pushing this checkpoint and will handle any merge. A merge to main does not automatically deploy.
 
