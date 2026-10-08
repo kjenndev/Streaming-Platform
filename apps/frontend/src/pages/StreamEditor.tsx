@@ -1,5 +1,6 @@
 import type { Stream } from '../models';
 import { fetchStreamCatalog } from '../pagination';
+import { sessionExpired, subscribeSession } from '../session';
 import React, { useState, useCallback, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Button } from 'primereact/button';
@@ -29,10 +30,33 @@ const INITIAL_STREAM_STATE = {
   restreamUrls: INITIAL_RESTREAM_STATE 
 };
 
+// One interrupted draft, in memory only (may contain channel/provider secrets).
+// Never auto-submit it or persist it to browser storage.
+type StreamForm = typeof INITIAL_STREAM_STATE & { streamKey?: string };
+let interruptedDraft: { owner: string; id?: string; form: StreamForm } | undefined;
+let unsubscribeDraft: (() => void) | undefined;
+function discardInterruptedDraft() {
+  interruptedDraft = undefined;
+  unsubscribeDraft?.();
+  unsubscribeDraft = undefined;
+}
 const StreamEditorSession = () => {
   const { id } = useParams();
   const navigate = useNavigate();
-  const [streamForm, setStreamForm] = useState<typeof INITIAL_STREAM_STATE & { streamKey?: string }>(INITIAL_STREAM_STATE);
+  const owner = localStorage.getItem('username') || '';
+  const [restoredDraft] = useState(() => interruptedDraft?.owner === owner && interruptedDraft?.id === id ? interruptedDraft : undefined);
+  const [streamForm, setStreamForm] = useState<StreamForm>(restoredDraft?.form || INITIAL_STREAM_STATE);
+  const abandoned = React.useRef(false);
+  useEffect(() => {
+    abandoned.current = false;
+    // Transfer recovery into this editor once; later navigation discards local edits.
+    // Clear mismatched recovery too, so another account/route cannot revive it.
+    discardInterruptedDraft();
+    return () => {
+      // A pending save may reject after unmount. Only expiry may retain its draft.
+      abandoned.current = !sessionExpired() || !!localStorage.getItem('token');
+    };
+  }, []);
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(false);
   const isEditMode = !!id;
@@ -73,11 +97,11 @@ const StreamEditorSession = () => {
 
   useEffect(() => {
     const controller = new AbortController();
-    if (isEditMode) {
+    if (isEditMode && !restoredDraft) {
       void Promise.resolve().then(() => fetchStream(controller.signal));
     }
     return () => controller.abort();
-  }, [fetchStream, isEditMode]);
+  }, [fetchStream, isEditMode, restoredDraft]);
 
 
 
@@ -100,8 +124,28 @@ const StreamEditorSession = () => {
         });
         toast.current?.show({ severity: 'success', summary: 'Created', detail: 'Channel created successfully', life: 3000 });
       }
+      discardInterruptedDraft();
       setTimeout(() => navigate('/dashboard'), 1000);
-    } catch {
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 401 && owner && !localStorage.getItem('token') && sessionExpired() && !abandoned.current) {
+        discardInterruptedDraft();
+        interruptedDraft = { owner, id, form: streamForm };
+        // Keep this listener only while recovery awaits consumption. Identity changes
+        // can happen on the login/dashboard routes where the editor is unmounted.
+        unsubscribeDraft = subscribeSession(change => {
+          if (change instanceof StorageEvent) {
+            if (change.storageArea && change.storageArea !== localStorage) return;
+            // Storage events describe remote transitions; this tab's expiry reason
+            // cannot classify them. Use event values, not a later storage snapshot:
+            // queued logout/account-switch events must still discard after re-login.
+            if (change.key === null ||
+                (change.key === 'token' && change.newValue === null) ||
+                (change.key === 'username' && change.newValue !== owner)) discardInterruptedDraft();
+          }
+          const currentOwner = localStorage.getItem('username');
+          if (currentOwner !== owner && (currentOwner || !sessionExpired())) discardInterruptedDraft();
+        });
+      }
       toast.current?.show({ severity: 'error', summary: 'Error', detail: 'Error saving channel', life: 3000 });
     } finally {
       setLoading(false);
@@ -201,6 +245,7 @@ const StreamEditorSession = () => {
             <h2 className="m-0" style={{ color: 'var(--text-h)' }}>{isEditMode ? 'Edit Channel' : 'New Channel'}</h2>
           </div>
 
+          {restoredDraft && <p role="status">Unsaved draft restored. Review it before saving.</p>}
           <div className="flex flex-column gap-5">
           <Card className="shadow-none border-1" style={{ backgroundColor: 'var(--bg-highlight)', borderColor: 'var(--base01)' }}>
             <div className="flex flex-column gap-3">

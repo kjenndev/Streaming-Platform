@@ -175,3 +175,12 @@ it('keeps performance details collapsed by default and lets admins expand and co
  expect(details).not.toHaveAttribute('open');
  expect(screen.getByText(/API RSS:/)).not.toBeVisible();
 });
+
+it('dashboard socket session rejection clears identity but transport errors do not',async()=>{
+ localStorage.setItem('token','socket-fixture');localStorage.setItem('username','fixture');
+ setup();await screen.findByText('alice');
+ act(()=>mocks.handlers.get('connect_error')?.({data:{status:503,code:'AUTH_UNAVAILABLE'}}));
+ expect(localStorage.getItem('token')).toBe('socket-fixture');
+ act(()=>mocks.handlers.get('connect_error')?.({data:{status:401,code:'SESSION_EXPIRED'}}));
+ expect(localStorage.getItem('token')).toBeNull();expect(localStorage.getItem('username')).toBeNull();
+});

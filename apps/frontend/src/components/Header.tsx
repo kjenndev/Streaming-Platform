@@ -9,6 +9,7 @@ import { Toast } from 'primereact/toast';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { API_BASE_URL } from '../config';
+import { clearIdentity } from '../session';
 
 const Header = () => {
   const navigate = useNavigate();
@@ -89,7 +90,7 @@ const Header = () => {
       label: 'Logout',
       icon: 'pi pi-sign-out',
       command: () => {
-        localStorage.clear();
+        clearIdentity();
         navigate('/login');
       }
     }

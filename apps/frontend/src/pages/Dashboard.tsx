@@ -1,3 +1,4 @@
+import { expireSession } from '../session';
 import { mergeStats } from '../dashboardStats';
 import type { Stream, Recording, Restream, ChannelStats, LiveStats } from '../models';
 import type { Socket } from 'socket.io-client';
@@ -157,6 +158,15 @@ const Dashboard = () => {
       auth: { token }
     });
     socketRef.current = socket;
+
+    const invalidSession = () => {
+      expireSession(token);
+    };
+    socket.on('session_invalid', invalidSession);
+    socket.on('connect_error', (error: Error & { data?: { status?: number } }) => {
+      if (error.data?.status === 401) invalidSession();
+    });
+
 
     let publishingSignature: string | undefined;
     socket.on('live_stats', (data: LiveStats) => {

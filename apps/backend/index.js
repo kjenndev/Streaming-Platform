@@ -18,6 +18,7 @@ const {processTelemetry}=require('./lib/process-runtime');
 const {superviseMedia}=require('./lib/media-supervisor');
 const playback=require('./lib/playback-auth');
 
+const {createRecordingRecovery}=require('./lib/recording-recovery');
 const recordingsRoot=path.resolve(process.env.RECORDINGS_ROOT || path.join(__dirname,'recordings'));
 const recordingPath=value=>{
  if(typeof value!=='string' || !value.startsWith('/recordings/') || value.includes('\\'))throw new Error('Invalid recording path');
@@ -41,6 +42,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 const redis = new Redis(process.env.REDIS_URL);
+const passwordBudget=require('./lib/password-budget').createPasswordBudget(redis);
 const membership=new Membership();
 const metadata=new Map();
 const settingsCache=new Map();
@@ -107,7 +109,7 @@ app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
-app.use(cors({exposedHeaders:['X-Total-Count','X-Next-Offset']}));
+app.use(cors({exposedHeaders:['X-Total-Count','X-Next-Offset','Retry-After']}));
 app.use(Express.json());
 // No anonymous static mount: resolve metadata, authorize its parent, then send.
 app.use('/recordings',async(req,res)=>{
@@ -126,6 +128,7 @@ app.use('/recordings',async(req,res)=>{
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  skipSuccessfulRequests: true,
   message: { error: 'Too many login attempts. Please try again after 15 minutes.' }
 });
 
@@ -138,13 +141,16 @@ io.use(async (socket, next) => {
     return next();
   }
   
+  let decoded;
+  const reject=(status,body)=>next(Object.assign(new Error(body.error),{data:{status,...body}}));
+  try{decoded=verifySession(token);}catch(error){return reject(401,sessionError(error));}
   try {
-    const decoded=jwt.verify(token,process.env.JWT_SECRET,{algorithms:['HS256']});
     const user=await principal(decoded.id);
-    if(!user)return next(new Error('Authentication error'));
+    if(!user)return reject(401,sessionError());
     socket.data.userId=user.id;socket.data.username=user.username;
+    socket.data.sessionExpiresAt=decoded.exp?decoded.exp*1000:null;
     socket.data.roles=user.roles;socket.data.isAnonymous=false;next();
-  }catch{return next(new Error('Authentication error'));}
+  }catch{return reject(503,{code:'AUTH_UNAVAILABLE',error:'Authentication service temporarily unavailable.'});}
 });
 
 // API owns membership and compact delivery; media owns ingest/live_streams.
@@ -252,15 +258,22 @@ async function principal(id, db=prisma) {
  const user=await db.user.findUnique({where:{id},select:{id:true,username:true,roles:true}});
  return user?.roles.length ? user : null;
 }
+function sessionError(error) {
+ return {code:error?.name==='TokenExpiredError'?'SESSION_EXPIRED':'SESSION_INVALID',error:'Your session has expired or is no longer valid. Please sign in again.'};
+}
+function verifySession(token) {
+ return jwt.verify(token.replace(/^Bearer /,''),process.env.JWT_SECRET,{algorithms:['HS256']});
+}
 const authenticateUser = async (req, res, next) => {
  const token=req.headers.authorization;
- if(!token)return res.status(401).json({error:'No token provided'});
+ if(!token)return res.status(401).json(sessionError());
+ let decoded;
+ try{decoded=verifySession(token);}catch(error){return res.status(401).json(sessionError(error));}
  try {
-  const decoded=jwt.verify(token.replace(/^Bearer /,''),process.env.JWT_SECRET,{algorithms:['HS256']});
   req.user=await principal(decoded.id);
-  if(!req.user)return res.status(403).json({error:'Access denied.'});
-  next();
- }catch {return res.status(403).json({error:'Access denied.'});}
+  if(!req.user)return res.status(401).json(sessionError());
+ }catch{return res.status(503).json({error:'Authentication service temporarily unavailable.'});}
+ next();
 };
 // Lock the acting principal within privilege-changing transactions. Concurrent
 // role updates/deletions must serialize with the authorization and write.
@@ -268,7 +281,8 @@ async function principalWrite(req, action, admin=true) {
  return prisma.$transaction(async db=>{
   await db.$queryRaw`SELECT id FROM "User" WHERE id = ${req.user.id} FOR UPDATE`;
   const user=await principal(req.user.id,db);
-  if(!user || (admin && !user.roles.includes('ADMIN')))throw Object.assign(new Error('Access denied'),{status:403});
+  if(!user)throw Object.assign(new Error('Session invalid'),{status:401});
+  if(admin && !user.roles.includes('ADMIN'))throw Object.assign(new Error('Access denied'),{status:403});
   return action(db,user);
  },{isolationLevel:'Serializable'});
 }
@@ -281,7 +295,7 @@ const requireAdmin = (req, res, next) => {
 // Re-read mutation principals so signed but stale roles cannot retain privileges.
 async function currentUser(req, res, next) {
  const user = await principal(req.user.id);
- if (!user) return res.status(403).json({error:'Access denied.'});
+ if (!user) return res.status(401).json(sessionError());
  req.user=user; next();
 }
 function requireManager(req,res,next) {
@@ -330,6 +344,17 @@ async function recordingReadable(req,stream){
  if(playback.assigned(stream,user) && (!stream.isDisabled || !user.roles.includes('CLIENT') || user.roles.includes('ADMIN')))return true;
  return playback.allowed(stream,req.query.cap,'recording',{db:prisma});
 }
+async function passwordAdmission(stream,authorized,password,address){
+ if(!stream || stream.isDisabled)return {ok:false,status:403};
+ if(!stream.isPasswordProtected || authorized)return {ok:true};
+ const budget=await passwordBudget(address,stream.id);
+ if(!budget.ok)return budget;
+ return {ok:typeof password==='string' && password===stream.password,status:403};
+}
+function passwordDenied(res,result){
+ if(result.retryAfter)res.set('Retry-After',String(result.retryAfter));
+ return res.status(result.status).json({error:result.status===403?'Access denied.':'Password attempts temporarily unavailable. Please retry later.',...(result.code?{code:result.code,retryAfter:result.retryAfter}:{})});
+}
 const playbackLimiter=rateLimit({windowMs:60000,max:30});
 app.post('/api/public/streams/:channelName/playback',playbackLimiter,async(req,res)=>{
  const stream=await prisma.stream.findUnique({where:{channelName:req.params.channelName},include:playback.streamInclude});
@@ -337,7 +362,8 @@ app.post('/api/public/streams/:channelName/playback',playbackLimiter,async(req,r
  if(!['live','recording','membership'].includes(purpose))return res.sendStatus(400);
  const user=await requestUser(req);
  const authorized=playback.assigned(stream || {},user);
- if(!stream || stream.isDisabled || (stream.isPasswordProtected && !authorized && !(typeof req.body.password==='string' && req.body.password===stream.password)))return res.sendStatus(403);
+ const admission=await passwordAdmission(stream,authorized,req.body.password,req.socket.remoteAddress);
+ if(!admission.ok)return passwordDenied(res,admission);
  res.set('Cache-Control','no-store');
  res.json({cap:playback.issue(stream,{purpose,user:authorized?user:undefined}),expiresIn:playback.TTL});
 });
@@ -492,7 +518,10 @@ app.delete('/api/recordings/:id', authenticateUser, currentUser, requireAdmin, a
   const rec = req.recording;
   if (rec) {
     const p=recordingPath(rec.filePath);
-    await principalWrite(req,db=>db.recording.delete({where:{id:req.params.id}}));
+    await principalWrite(req,async db=>{
+      await createRecordingRecovery({root:recordingsRoot,prisma}).markDeleted(db,rec);
+      await db.recording.delete({where:{id:rec.id}});
+    });
     if(fs.existsSync(p))fs.unlinkSync(p);
   }
   res.json({ success: true });
@@ -553,7 +582,8 @@ app.post('/api/public/recordings/:id/playback',playbackLimiter,async(req,res)=>{
  const stream=rec?.stream,user=await requestUser(req);
  const authorized=playback.assigned(stream || {},user);
  const renewing=!!req.body.cap && await playback.allowed(stream,req.body.cap,'recording',{db:prisma});
- if(!stream || stream.isDisabled || (stream.isPasswordProtected && !authorized && !renewing && !(typeof req.body.password==='string' && req.body.password===stream.password)))return res.sendStatus(403);
+ const admission=await passwordAdmission(stream,authorized || renewing,req.body.password,req.socket.remoteAddress);
+ if(!admission.ok)return passwordDenied(res,admission);
  const actor=renewing?playback.decode(req.body.cap,'recording').actor:null;
  const grantUser=actor?await prisma.user.findUnique({where:{id:actor}}):authorized?user:undefined;
  res.set('Cache-Control','no-store');
@@ -588,7 +618,9 @@ app.get('/api/public/recordings/:id', async (req, res) => {
 // --- WebSockets for Chat & Dashboard ---
 io.on('connection',socket=>{
  const isAdmin=async()=>{
+  if(!socketSessionActive(socket))return false;
   const user=await principal(socket.data.userId);
+  if(socket.data.userId && !user){invalidateSocket(socket);return false;}
   const ok=!!user?.roles.includes('ADMIN');
   if(!ok)socket.leave('dashboard');
   return ok;
@@ -598,17 +630,17 @@ io.on('connection',socket=>{
  socket.on('leave_dashboard',()=>socket.leave('dashboard'));
  const valid=(channel,username)=>typeof channel==='string' && /^[a-zA-Z0-9_-]{1,128}$/.test(channel) && typeof username==='string' && username.trim().length>0 && username.length<=64;
  socket.on('check_username',(input={},callback)=>{input=input || {};if(typeof callback==='function')callback({available:valid(input.channelName,input.username) && !membership.channels.get(input.channelName)?.has(input.username)});});
- let joinGeneration=0, joinWindow=0, joinAttempts=0;
+ let joinGeneration=0;
  socket.on('join_channel',async(input={},callback)=>{input=input || {};
   const generation=++joinGeneration;
-  let ok=false,cap;
-  if(Date.now()-joinWindow>60000){joinWindow=Date.now();joinAttempts=0;}
-  if(++joinAttempts<=20 && valid(input.channelName,input.username)){
+  let ok=false,cap,admission;
+  if(valid(input.channelName,input.username) && socketSessionActive(socket)){
    try{
     const stream=await prisma.stream.findUnique({where:{channelName:input.channelName},include:playback.streamInclude});
     const user=socket.data.userId?await prisma.user.findUnique({where:{id:socket.data.userId}}):null;
     const authorized=playback.assigned(stream || {},user);
-    if(stream && !stream.isDisabled && (!socket.data.userId || user?.roles.length) && (!stream.isPasswordProtected || authorized || (typeof input.password==='string' && input.password===stream.password)) && generation===joinGeneration && socket.connected){
+    admission=await passwordAdmission(stream,authorized,input.password,socket.request.socket.remoteAddress);
+    if(admission.ok && (!socket.data.userId || user?.roles.length) && generation===joinGeneration && socket.connected){
      cap=playback.issue(stream,{user:authorized?user:undefined});
      membership.join(socket,input.channelName,input.username);
      socket.data.membershipCap=playback.issue(stream,{purpose:'membership',user:authorized?user:undefined});
@@ -616,13 +648,13 @@ io.on('connection',socket=>{
     }
    }catch{}
   }
-  if(typeof callback==='function')callback(ok?{ok:true,cap,expiresIn:playback.TTL}:{ok:false,error:'Invalid password, channel or unavailable username'});
+  if(typeof callback==='function')callback(ok?{ok:true,cap,expiresIn:playback.TTL}:{ok:false,error:'Invalid password, channel or unavailable username',...(admission?.code?{code:admission.code,retryAfter:admission.retryAfter,status:admission.status}:{})});
  });
  socket.on('renew_playback',async(_input,callback)=>{
   let response={ok:false};
   try{
    const channel=socket.data.playbackChannel;
-   if(channel){
+   if(channel && socketSessionActive(socket)){
     const stream=await prisma.stream.findUnique({where:{channelName:channel},include:playback.streamInclude});
     if(await playback.allowed(stream,socket.data.membershipCap,'membership',{db:prisma,ignoreExpiration:true}) && socket.connected && socket.data.playbackChannel===channel){
      const claims=playback.decode(socket.data.membershipCap,'membership',true);
@@ -634,7 +666,7 @@ io.on('connection',socket=>{
   if(typeof callback==='function')callback(response);
  });
  socket.on('send_message',(input={},callback)=>{input=input || {};
-  const ok=chatAllowed(socket,input.channelName,input.message);
+  const ok=socketSessionActive(socket) && chatAllowed(socket,input.channelName,input.message);
   if(ok)io.to(`channel:${input.channelName}`).emit('receive_message',{username:socket.data.username,message:input.message,time:Date.now()});
   if(typeof callback==='function')callback({ok});
  });
@@ -653,7 +685,16 @@ async function emitDashboard(event,payload){
  if(!sockets.length)return;
  const users=await prisma.user.findMany({where:{id:{in:sockets.map(s=>s.data.userId)},roles:{has:'ADMIN'}},select:{id:true}});
  const allowed=new Set(users.map(u=>u.id));
- for(const socket of sockets){if(allowed.has(socket.data.userId))socket.emit(event,payload);else socket.leave('dashboard');}
+ for(const socket of sockets){if(socketSessionActive(socket) && allowed.has(socket.data.userId))socket.emit(event,payload);else socket.leave('dashboard');}
+}
+function invalidateSocket(socket,error) {
+ socket.emit('session_invalid',sessionError(error));socket.disconnect(true);
+}
+function socketSessionActive(socket) {
+ if(socket.data.userId && socket.data.sessionExpiresAt && Date.now()>=socket.data.sessionExpiresAt){
+  invalidateSocket(socket,{name:'TokenExpiredError'});return false;
+ }
+ return socket.connected;
 }
 async function revalidateSockets(){
  const users=new Map(),streams=new Map();
@@ -661,8 +702,9 @@ async function revalidateSockets(){
  const sockets=[...io.sockets.sockets.values()];
  await playback.deadline(Promise.all(sockets.map(async socket=>{
   try{
+   if(!socketSessionActive(socket))return;
    const user=socket.data.userId?await db.user.findUnique({where:{id:socket.data.userId}}):null;
-   if(socket.data.userId && !user?.roles.length){socket.disconnect(true);return;}
+   if(socket.data.userId && !user?.roles.length){invalidateSocket(socket);return;}
    if(!user?.roles.includes('ADMIN'))socket.leave('dashboard');
    const channel=socket.data.playbackChannel;
    if(channel){
