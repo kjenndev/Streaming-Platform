@@ -57,6 +57,7 @@ function App() {
             </ProtectedRoute>
           } 
         />
+        <Route path="/embed/:channelName" element={<Player videoOnly />} />
         <Route path="/watch/:channelName" element={<Player />} />
         <Route path="/share/:id" element={<SharePlayer />} />
         <Route path="/" element={<Navigate to="/dashboard" replace />} />

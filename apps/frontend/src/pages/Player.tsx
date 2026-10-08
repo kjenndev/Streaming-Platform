@@ -15,7 +15,9 @@ import EmojiPicker, { Theme } from 'emoji-picker-react';
 import StatusMessage from '../components/StatusMessage';
 import { API_BASE_URL, MEDIA_BASE_URL, SOCKET_URL } from '../config';
 
-const PlayerSession = () => {
+type PlayerProps = { videoOnly?: boolean };
+
+const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
   const { channelName } = useParams();
   const [stream, setStream] = useState<Stream | null>(null);
   const joinPassword = useRef('');
@@ -80,11 +82,15 @@ const PlayerSession = () => {
 
   useEffect(() => {
     if (isAuthorized && videoRef.current && channelName && stream?.isLive) {
-      const playback = startLivePlayback(videoRef.current, () => `${MEDIA_BASE_URL}/live/${channelName}.flv${playbackCap.current ? `?cap=${encodeURIComponent(playbackCap.current)}` : ''}`, setPlaybackSuspended);
+      const playback = startLivePlayback(videoRef.current, () => `${MEDIA_BASE_URL}/live/${channelName}.flv${playbackCap.current ? `?cap=${encodeURIComponent(playbackCap.current)}` : ''}`, setPlaybackSuspended, videoOnly ? message => {
+        setError(message);
+        setIsAuthorized(false);
+        setJoinUsername(null);
+      } : undefined);
       playbackRef.current = playback;
       return () => { playback(); playbackRef.current = null; };
     }
-  }, [isAuthorized, channelName, stream?.isLive]);
+  }, [isAuthorized, channelName, stream?.isLive, videoOnly]);
 
   useEffect(() => {
     const socket = socketRef.current;
@@ -140,13 +146,13 @@ const PlayerSession = () => {
         socket.emit('join_channel', { channelName, username: joinUsername, password: joinPassword.current }, (response: { ok: boolean; error?: string; cap?: string }) => {
           if (!active || request !== generation || socketRef.current !== socket) return;
           clearTimeout(deadline);
-          joined = response?.ok === true;
+          joined = response?.ok === true && (!videoOnly || !!response.cap);
           playbackCap.current = joined ? response.cap || '' : '';
           clearTimeout(renewal);
           if (joined && response.cap) renewal = setTimeout(renew, 60000);
           setIsAuthorized(joined);
           if (!joined) {
-            setError(response?.error || 'This username is already taken in this channel');
+            setError(response?.error || (videoOnly ? 'Playback admission failed. Please retry.' : 'This username is already taken in this channel'));
             setJoinUsername(null);
           } else {
             setError('');
@@ -155,6 +161,11 @@ const PlayerSession = () => {
         });
       };
       const kicked = () => {
+        if (videoOnly) {
+          expire();
+          setError('You have been removed from this stream.');
+          return;
+        }
         alert('You have been kicked from this stream by an administrator.');
         window.location.reload();
       };
@@ -182,14 +193,14 @@ const PlayerSession = () => {
         socket.emit('leave_channel');
       };
     }
-  }, [joinUsername, channelName]);
+  }, [joinUsername, channelName, videoOnly]);
 
 
 
   const handleJoin = () => {
     setError('');
     
-    if (!formData.username.trim()) {
+    if (!videoOnly && !formData.username.trim()) {
       setError('Username is required');
       return;
     }
@@ -197,7 +208,8 @@ const PlayerSession = () => {
     joinPassword.current = formData.password;
 
     // The join acknowledgement, not an availability precheck, grants membership.
-    setJoinUsername(formData.username);
+    // Ephemeral viewer identity satisfies existing room admission without a chat form.
+    setJoinUsername(videoOnly ? `viewer-${crypto.getRandomValues(new Uint32Array(4)).join('-')}` : formData.username);
   };
 
   const sendMessage = () => {
@@ -215,6 +227,24 @@ const PlayerSession = () => {
   const onEmojiClick = (emojiData: { emoji: string }) => {
     setNewMessage(prev => prev + emojiData.emoji);
   };
+
+  if (videoOnly) {
+    const message = !stream ? (error || 'Loading stream…')
+      : stream.isDisabled ? 'Stream unavailable.'
+      : !stream.isLive ? 'Stream offline.' : '';
+    return <main aria-label="Live video" style={{ width: '100%', height: '100dvh', background: '#000', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'auto' }}>
+      {message ? <div role="status" style={{ padding: 16, textAlign: 'center' }}>{message}{(error || stream) && <div><Button label="Retry" onClick={() => window.location.reload()} /></div>}</div>
+      : !isAuthorized ? <form onSubmit={event => { event.preventDefault(); handleJoin(); }} style={{ padding: 12, maxWidth: '100%', maxHeight: '100%', overflow: 'auto', display: 'grid', gap: 8 }}>
+        {stream?.isPasswordProtected && <><label htmlFor="embed-password">Stream password</label><InputText id="embed-password" type="password" autoComplete="off" value={formData.password} onChange={event => setFormData({ ...formData, password: event.target.value })} style={{ width: '100%', minWidth: 0 }} /></>}
+        {error && <div role="alert">{error}</div>}
+        <Button type="submit" label={joinUsername !== null ? 'Connecting…' : error ? 'Retry playback' : 'Watch live'} disabled={joinUsername !== null} />
+      </form>
+      : <>
+        <video ref={videoRef} controls playsInline aria-label="Live stream" style={{ display: 'block', width: '100%', height: '100%', objectFit: 'contain' }} />
+        {playbackSuspended && <Button label="Resume live" style={{ position: 'absolute' }} onClick={() => playbackRef.current?.resume()} />}
+      </>}
+    </main>;
+  }
 
   if (!stream) return <div className="p-4 text-white">Loading stream...</div>;
 
@@ -362,8 +392,8 @@ const PlayerSession = () => {
   );
 };
 
-const Player = () => {
+const Player = ({ videoOnly = false }: PlayerProps) => {
   const { channelName } = useParams();
-  return <PlayerSession key={channelName} />;
+  return <PlayerSession key={`${channelName}:${videoOnly}`} videoOnly={videoOnly} />;
 };
 export default Player;
