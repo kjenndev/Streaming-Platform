@@ -1,7 +1,7 @@
 import flvjs from 'flv.js';
 
 // One recovery timer per mount; never reset the budget on a transient success.
-export function startLivePlayback(video: HTMLVideoElement, url: string | (() => string), onSuspended?: (suspended: boolean) => void) {
+export function startLivePlayback(video: HTMLVideoElement, url: string | (() => string), onSuspended?: (suspended: boolean) => void, onError?: (message: string) => void) {
   let player: flvjs.Player | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
@@ -22,7 +22,8 @@ export function startLivePlayback(video: HTMLVideoElement, url: string | (() => 
     previous.destroy();
   };
   const recover = () => {
-    if (disposed || suspended || timer || retries >= 3) return;
+    if (disposed || suspended || timer) return;
+    if (retries >= 3) { onError?.('Live playback failed. Please retry.'); return; }
     const delay = 1000 * 2 ** retries++;
     timer = setTimeout(() => {
       timer = undefined;
@@ -31,7 +32,7 @@ export function startLivePlayback(video: HTMLVideoElement, url: string | (() => 
     }, delay);
   };
   const create = () => {
-    if (!flvjs.isSupported()) return;
+    if (!flvjs.isSupported()) { onError?.('Live playback is not supported in this browser.'); return; }
     player = flvjs.createPlayer({ type: 'flv', isLive: true, url: typeof url === 'function' ? url() : url }, {
       autoCleanupSourceBuffer: true,
       autoCleanupMaxBackwardDuration: 30,

@@ -174,3 +174,88 @@ it('passes the current account token so assigned viewers can join without the sh
  expect(io).toHaveBeenCalledWith(expect.any(String),{auth:{token:'current-account-jwt'}});
  expect(mocks.emit).toHaveBeenCalledWith('join_channel',{channelName:'mine',username:'assigned-viewer',password:''},expect.any(Function));
 });
+
+
+it('video-only presentation starts explicitly without a username prompt and keeps admission/capability lifecycle', async () => {
+ vi.mocked(axios.get).mockResolvedValue({data:{channelName:'mine',isLive:true}});
+ const acks: ((r:{ok:boolean;cap?:string})=>void)[]=[];
+ mocks.emit.mockImplementation((name,_payload,ack)=>{if(name==='join_channel')acks.push(ack);});
+ const view=render(<MemoryRouter initialEntries={['/embed/mine']}><Routes><Route path="/embed/:channelName" element={<Player videoOnly/>}/></Routes></MemoryRouter>);
+ fireEvent.click(await screen.findByRole('button',{name:'Watch live'}));
+ expect(screen.queryByPlaceholderText('Choose a name')).not.toBeInTheDocument();
+ expect(view.container.querySelector('video')).toBeNull();
+ expect(mocks.emit).toHaveBeenCalledWith('join_channel',{channelName:'mine',username:expect.stringMatching(/^viewer-/),password:''},expect.any(Function));
+ act(()=>acks[0]({ok:true,cap:'embed-cap'}));
+ await waitFor(()=>expect(view.container.querySelector('video')).toHaveAttribute('controls'));
+ expect(screen.queryByText('Stream Chat')).not.toBeInTheDocument();
+ expect(screen.queryByRole('log')).not.toBeInTheDocument();
+ expect(screen.queryByText(/Viewers/)).not.toBeInTheDocument();
+ expect(view.container.querySelector('video')).not.toHaveAttribute('autoplay');
+ expect(typeof mocks.url==='function'?mocks.url():mocks.url).toContain('cap=embed-cap');
+ act(()=>mocks.handlers.get('disconnect')!());
+ expect(view.container.querySelector('video')).toBeNull();
+ expect(mocks.dispose).toHaveBeenCalled();
+ view.unmount();
+});
+
+
+it('embed route has no page chrome and requires a capability, not just a positive join ack', async()=>{
+ const {default:App}=await import('../App');
+ window.history.replaceState({},'', '/embed/mine');
+ vi.mocked(axios.get).mockResolvedValue({data:{channelName:'mine',isLive:true}});
+ mocks.emit.mockImplementation((name,_payload,ack)=>{if(name==='join_channel')ack({ok:true});});
+ const view=render(<App/>);
+ fireEvent.click(await screen.findByRole('button',{name:'Watch live'}));
+ await waitFor(()=>expect(screen.getByRole('alert')).toBeInTheDocument());
+ expect(view.container.querySelector('video')).toBeNull();
+ expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+ expect(screen.queryByText('Stream Chat')).not.toBeInTheDocument();
+ expect(screen.queryByPlaceholderText('Choose a name')).not.toBeInTheDocument();
+ window.history.replaceState({},'', '/');
+});
+
+it('embed retains password admission, retry, renewal denial and stops revoked anonymous playback',async()=>{
+ vi.mocked(axios.get).mockResolvedValue({data:{channelName:'mine',isLive:true,isPasswordProtected:true}});
+ mocks.emit.mockImplementation((name,payload,ack)=>{if(name==='join_channel')ack(payload.password==='fixture-password'?{ok:true,cap:'protected-cap'}:{ok:false,error:'Invalid password'});if(name==='renew_playback')ack({ok:false});});
+ const view=render(<MemoryRouter initialEntries={['/embed/mine']}><Routes><Route path="/embed/:channelName" element={<Player videoOnly/>}/></Routes></MemoryRouter>);
+ fireEvent.click(await screen.findByRole('button',{name:'Watch live'}));
+ expect(await screen.findByRole('alert')).toHaveTextContent('Invalid password');
+ expect(screen.getByLabelText('Stream password').closest('form')).toHaveStyle({maxHeight:'100%',overflow:'auto'});
+ expect(view.container.querySelector('video')).toBeNull();
+ fireEvent.change(screen.getByLabelText('Stream password'),{target:{value:'fixture-password'}});
+ vi.useFakeTimers();
+ fireEvent.click(screen.getByRole('button',{name:'Retry playback'}));
+ expect(view.container.querySelector('video')).not.toBeNull();
+ expect(typeof mocks.url==='function'?mocks.url():mocks.url).toContain('cap=protected-cap');
+ expect(typeof mocks.url==='function'?mocks.url():mocks.url).not.toContain('fixture-password');
+ act(()=>vi.advanceTimersByTime(60000));
+ expect(view.container.querySelector('video')).toBeNull();
+ expect(mocks.dispose).toHaveBeenCalled();
+ expect(mocks.emit).toHaveBeenCalledWith('leave_channel');
+ view.unmount();expect(vi.getTimerCount()).toBe(0);
+});
+
+it('embed stops on a kick without modal alerts or automatically rejoining',async()=>{
+ vi.mocked(axios.get).mockResolvedValue({data:{isLive:true}});
+ mocks.emit.mockImplementation((name,_payload,ack)=>{if(name==='join_channel')ack({ok:true,cap:'public-cap'});});
+ const alert=vi.spyOn(window,'alert').mockImplementation(()=>{});
+ const view=render(<MemoryRouter initialEntries={['/embed/mine']}><Routes><Route path="/embed/:channelName" element={<Player videoOnly/>}/></Routes></MemoryRouter>);
+ fireEvent.click(await screen.findByRole('button',{name:'Watch live'}));
+ act(()=>mocks.handlers.get('kicked')!());
+ expect(view.container.querySelector('video')).toBeNull();
+ expect(screen.getByRole('alert')).toHaveTextContent('removed');
+ expect(alert).not.toHaveBeenCalled();alert.mockRestore();
+});
+
+
+it('starts an embed on HTTP origins where randomUUID is unavailable',async()=>{
+ const getRandomValues=crypto.getRandomValues.bind(crypto);
+ vi.stubGlobal('crypto',{getRandomValues});
+ try {
+  vi.mocked(axios.get).mockResolvedValue({data:{isLive:true}});
+  mocks.emit.mockImplementation((name,_payload,ack)=>{if(name==='join_channel')ack({ok:true,cap:'fixture-cap'});});
+  const view=render(<MemoryRouter initialEntries={['/embed/mine']}><Routes><Route path="/embed/:channelName" element={<Player videoOnly/>}/></Routes></MemoryRouter>);
+  fireEvent.click(await screen.findByRole('button',{name:'Watch live'}));
+  await waitFor(()=>expect(view.container.querySelector('video')).not.toBeNull());
+ } finally { vi.unstubAllGlobals(); }
+});

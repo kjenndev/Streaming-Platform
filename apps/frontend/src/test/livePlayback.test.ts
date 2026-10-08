@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import flvjs from 'flv.js';
 import { startLivePlayback } from '../livePlayback';
-vi.mock('flv.js', () => ({ default: { isSupported: () => true, Events: { ERROR: 'error' }, createPlayer: vi.fn() } }));
+vi.mock('flv.js', () => ({ default: { isSupported: vi.fn(() => true), Events: { ERROR: 'error' }, createPlayer: vi.fn() } }));
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
 it('bounds live buffers and coalesces error retries, disposing timers and listeners', () => {
   vi.useFakeTimers();
@@ -146,4 +146,18 @@ it('keeps replacement playback active after real flv destroy queues a native pau
  dispose();
  await vi.runAllTimersAsync();
  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('reports unsupported playback and exhausted recovery to an optional embed error surface',()=>{
+ const failed=vi.fn();
+ vi.mocked(flvjs.isSupported).mockReturnValueOnce(false);
+ const unsupported=startLivePlayback(document.createElement('video'),'/fixture.flv',undefined,failed);
+ expect(failed).toHaveBeenCalledWith('Live playback is not supported in this browser.');
+ unsupported();failed.mockClear();vi.useFakeTimers();
+ let error:()=>void=()=>{};
+ vi.mocked(flvjs.createPlayer).mockImplementation(()=>({attachMediaElement:vi.fn(),load:vi.fn(),play:vi.fn().mockResolvedValue(undefined),destroy:vi.fn(),off:vi.fn(),on:vi.fn((_event,handler)=>{error=handler;})}) as unknown as flvjs.Player);
+ const dispose=startLivePlayback(document.createElement('video'),'/fixture.flv',undefined,failed);
+ for(let i=0;i<4;i++){error();vi.advanceTimersByTime(10000);}
+ expect(failed).toHaveBeenCalledWith('Live playback failed. Please retry.');
+ dispose();
 });
