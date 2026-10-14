@@ -1,33 +1,37 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useLayoutEffect, useRef } from 'react';
 import type { ChatMessage } from '../chat';
 
-const ROW_HEIGHT = 80;
-const WINDOW_SIZE = 24;
+const FOLLOW_THRESHOLD = 80;
+// appendMessage retains object identity when trimming history. Stable keys let
+// native scroll anchoring preserve the reader's position as old rows disappear.
+const messageKeys = new WeakMap<ChatMessage, number>();
+let nextMessageKey = 0;
+function messageKey(message: ChatMessage) {
+  let key = messageKeys.get(message);
+  if (key === undefined) {
+    key = nextMessageKey++;
+    messageKeys.set(message, key);
+  }
+  return key;
+}
 export default function ChatMessages({ messages, username }: { messages: ChatMessage[]; username: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
-  const [start, setStart] = useState(0);
   useLayoutEffect(() => {
     const node = ref.current;
-    if (node && follow.current) {
-      node.scrollTop = node.scrollHeight;
-      node.dispatchEvent(new Event('scroll', { bubbles: true }));
-    }
+    if (node && follow.current) node.scrollTop = node.scrollHeight;
   }, [messages]);
-  const first = Math.min(start, Math.max(0, messages.length - 1));
-  return <div ref={ref} role="log" aria-label="Stream chat" className="flex-grow-1 overflow-y-auto p-3" style={{ backgroundColor: 'var(--bg)', minHeight: 0, maxHeight: 1440 }}
+  return <div ref={ref} role="log" aria-label="Stream chat" className="flex-grow-1 overflow-y-auto p-3" style={{ backgroundColor: 'var(--bg)', flexBasis: 0, minHeight: 0, maxHeight: 1440 }}
     onScroll={event => {
       const node = event.currentTarget;
-      follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < ROW_HEIGHT;
-      setStart(Math.max(0, Math.floor(node.scrollTop / ROW_HEIGHT) - 2));
+      follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < FOLLOW_THRESHOLD;
     }}>
-    <div style={{ height: messages.length * ROW_HEIGHT, position: 'relative' }}>
-      {messages.slice(first, first + WINDOW_SIZE).map((msg, i) => <div data-testid="chat-row" key={first + i} className="line-height-3 text-sm" style={{ position: 'absolute', top: (first + i) * ROW_HEIGHT, height: ROW_HEIGHT, width: '100%', overflow: 'auto', overflowWrap: 'anywhere', paddingBottom: 12 }}>
-        {msg.isSystem ? <span className="italic" style={{ color: 'var(--base01)' }}>{msg.message}</span> : <>
-          <span className="font-bold mr-2" style={{ color: msg.username === username ? 'var(--green)' : 'var(--blue)' }}>{msg.username}</span>
-          <span style={{ color: 'var(--text)' }}>{msg.message}</span>
-        </>}
-      </div>)}
-    </div>
+    {/* History is capped at 500 messages by appendMessage; let wrapped rows size naturally. */}
+    {messages.map(msg => <div data-testid="chat-row" key={messageKey(msg)} className="line-height-3 text-sm" style={{ overflowWrap: 'anywhere', paddingBottom: 4 }}>
+      {msg.isSystem ? <span className="italic" style={{ color: 'var(--base01)' }}>{msg.message}</span> : <>
+        <span className="font-bold mr-2" style={{ color: msg.username === username ? 'var(--green)' : 'var(--blue)' }}>{msg.username}</span>
+        <span style={{ color: 'var(--text)' }}>{msg.message}</span>
+      </>}
+    </div>)}
   </div>;
 }
