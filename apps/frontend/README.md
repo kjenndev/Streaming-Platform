@@ -49,6 +49,18 @@ To build the application for production, you must set the environment variables 
    ```
 3. The production-ready files will be in the `dist/` directory.
 
+## Chat layout regression
+
+`src/test/chat.test.tsx` covers bounded history, follow-scroll state and escaped message rendering. Native geometry is checked separately by `scripts/chat-layout.mjs` (requires an existing Playwright installation and Chromium):
+
+```bash
+# Never replace dist while the local preview is serving it.
+node ../../node_modules/vite/bin/vite.js build --outDir /absolute/external/chat-build
+node scripts/chat-layout.mjs /absolute/external/chat-build /absolute/external/chat-evidence
+```
+
+If Playwright is installed outside this workspace, set `PLAYWRIGHT_MODULE` to its `index.mjs` file URL. The harness intercepts all networking, supplies synthetic Socket.IO/API events and inert media, and checks 1280/390/320px geometry, wrapped messages, history, input stability and local send behavior. It writes screenshots and `compactchat-report.json`; it never joins or sends to a real channel.
+
 ## Design Language
 The UI follows strict **Solarized Dark** principles:
 - **Background**: `#002b36` (base03)

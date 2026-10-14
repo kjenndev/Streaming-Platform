@@ -350,7 +350,7 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
       </div>
 
       {showChat && (
-        <div className="w-22rem md:w-24rem flex flex-column border-left-1 h-full shadow-4" style={{ backgroundColor: 'var(--bg-highlight)', borderColor: 'var(--base01)' }}>
+        <div className="w-22rem md:w-24rem flex flex-column border-left-1 h-full shadow-4" style={{ backgroundColor: 'var(--bg-highlight)', borderColor: 'var(--base01)', maxWidth: '100%' }}>
           <div className="p-3 border-bottom-1 font-bold text-sm tracking-wider uppercase flex justify-content-between" style={{ borderColor: 'var(--base01)', color: 'var(--base0)' }}>
             <span>Stream Chat</span>
             <span className="text-xs" style={{ color: 'var(--blue)' }}>@{formData.username}</span>
