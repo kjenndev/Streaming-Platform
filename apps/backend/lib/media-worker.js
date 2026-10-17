@@ -9,23 +9,14 @@ const {ManagedProcesses,processTelemetry}=require('./process-runtime');
 const {gatePublisher}=require('./publisher-auth');
 const {gatePlayback}=require('./playback-gate');
 const playback=require('./playback-auth');
-async function authorizePlayback(session,ignoreExpiration=false,db=prisma){
- const match=/^\/live\/([a-zA-Z0-9_-]{1,128})$/.exec(session.streamPath || '');
- if(!match)return false;
- const stream=await db.stream.findUnique({where:{channelName:match[1]},include:playback.streamInclude});
- const token=session.streamQuery?.cap;
- // Relay tokens are publisher-generation scoped, never a generic loopback bypass.
- const relay=playback.decode(token,'relay',ignoreExpiration);
- if(relay && (session.protocol!=='rtmp' || !['127.0.0.1','::1','::ffff:127.0.0.1'].includes(session.socket?.remoteAddress)))return false;
- const purpose=relay?'relay':'live';
- return playback.allowed(stream,token,purpose,{db,ignoreExpiration,publisher:session.broadcast?.publisher?.id});
-}
+const delegation=require('./mss-delegation').createMssDelegation({env:process.env});
 const {ChannelState}=require('./channel-state');
 const channelState=new ChannelState();
 // Media owns live_streams and publisher lifecycle. API owns viewer membership.
 // Credentials are inherited only in the child environment, never sent over IPC.
 const pool=new Pool({connectionString:process.env.DATABASE_URL});
 const prisma=new PrismaClient({adapter:new PrismaPg(pool)});
+const authorizePlayback=require('./media-playback-auth').createMediaPlaybackAuthorizer({db:prisma,delegation});
 const redis=new Redis(process.env.REDIS_URL);
 const context=require('node-media-server/src/core/context');
 const safety=require('./media-safety').installMediaSafety();
@@ -47,8 +38,13 @@ async function authorize(session){
 for(const file of ['rtmp_session','flv_session']){
  const filename=require.resolve(`node-media-server/src/session/${file}`), Original=require(filename);
  require.cache[filename].exports=class AuthorizedSession extends Original {
-  constructor(...args){super(...args);
+ constructor(...args){super(...args);
    if(!this.socket) this.socket=this.req.socket;
+   // Keep a distinct authorization path while consuming the existing live broadcast.
+   if(this.streamApp==='mss-live' && !this.isPublisher){
+    const live=context.broadcasts.get(`/live/${this.streamName}`);
+    if(live)this.broadcast=live;
+   }
    gatePublisher(this,authorize);
    gatePlayback(this,authorizePlayback);
   }
@@ -124,7 +120,7 @@ async function revalidatePlayback(){
  const db={stream:{findUnique:a=>memo('stream',a)},user:{findUnique:a=>memo('user',a)}};
  const viewers=[...context.sessions.values()].filter(s=>s.playbackAdmitted);
  await playback.deadline(Promise.all(viewers.map(async s=>{
-  try{if(!await authorizePlayback(s,true,db))s.close();}catch{s.close();}
+  try{if(!await require('./media-playback-auth').createMediaPlaybackAuthorizer({db,delegation})(s,false))s.close();}catch{s.close();}
  }))).catch(()=>{for(const s of viewers)s.close();});
 }
 async function snapshot(){

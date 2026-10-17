@@ -29,7 +29,7 @@ export default function ChatMessages({ messages, username }: { messages: ChatMes
     {/* History is capped at 500 messages by appendMessage; let wrapped rows size naturally. */}
     {messages.map(msg => <div data-testid="chat-row" key={messageKey(msg)} className="line-height-3 text-sm" style={{ overflowWrap: 'anywhere', paddingBottom: 4 }}>
       {msg.isSystem ? <span className="italic" style={{ color: 'var(--base01)' }}>{msg.message}</span> : <>
-        <span className="font-bold mr-2" style={{ color: msg.username === username ? 'var(--green)' : 'var(--blue)' }}>{msg.username}</span>
+        <span className="font-bold mr-2" style={{ color: (msg.identity?.displayName || msg.username) === username ? 'var(--green)' : 'var(--blue)' }}>{msg.identity?.displayName || msg.username}{msg.identity?.verified && <span aria-label="Verified MSS artist"> ✓</span>}</span>
         <span style={{ color: 'var(--text)' }}>{msg.message}</span>
       </>}
     </div>)}

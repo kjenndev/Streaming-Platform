@@ -1,3 +1,4 @@
+import './ManagerPlayer.css';
 import { expireSession } from '../session';
 import type { Stream, LiveStats } from '../models';
 import ChatMessages from '../components/ChatMessages';
@@ -15,15 +16,18 @@ import EmojiPicker, { Theme } from 'emoji-picker-react';
 import StatusMessage from '../components/StatusMessage';
 import { API_BASE_URL, MEDIA_BASE_URL, SOCKET_URL } from '../config';
 
-type PlayerProps = { videoOnly?: boolean };
+export type ManagerPlayer = {channelName:string;grant:string;displayName:string;isLive:boolean;watching:boolean;onAdmission:(admitted:boolean,response?:{credentials?:{server?:string;streamKey?:string}})=>void;onGrantRefreshed:(grant:string)=>void;onAuthorizationLost:()=>void;onWatch:()=>void;onStop:()=>void};
+type PlayerProps = { videoOnly?: boolean; manager?: ManagerPlayer };
 
-const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
-  const { channelName } = useParams();
-  const [stream, setStream] = useState<Stream | null>(null);
+export const PlayerSession = ({ videoOnly = false, manager }: PlayerProps) => {
+  const params = useParams();
+  const channelName = manager?.channelName || params.channelName;
+  const [stream, setStream] = useState<Stream | null>(()=>manager?{id:`mss:${channelName}`,channelName:channelName!,isLive:manager.isLive,isDisabled:false}:null);
   const joinPassword = useRef('');
   const playbackCap = useRef('');
-  const [joinUsername, setJoinUsername] = useState<string | null>(null);
+  const [joinUsername, setJoinUsername] = useState<string | null>(manager?.displayName ?? null);
   const [isAuthorized, setIsAuthorized] = useState(false);
+  const [previewMuted, setPreviewMuted] = useState(true);
   const [formData, setFormData] = useState({ username: '', password: '' });
   const [error, setError] = useState('');
   
@@ -37,18 +41,21 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
   const playbackRef = useRef<ReturnType<typeof startLivePlayback> | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const socketRef = useRef<Socket | null>(null);
+  const managerGrantRef = useRef(manager?.grant);
+  const refreshGeneration = useRef(0);
   const toast = useRef<Toast>(null);
 
   useEffect(() => {
     const controller = new AbortController();
-    void axios.get<Stream>(`${API_BASE_URL}/api/public/streams/${channelName}`, { signal: controller.signal })
+    if(!manager)void axios.get<Stream>(`${API_BASE_URL}/api/public/streams/${channelName}`, { signal: controller.signal })
       .then(res => { if (!controller.signal.aborted) setStream(res.data); })
       .catch(() => { if (!controller.signal.aborted) setError('Stream not found'); });
-    const token = localStorage.getItem('token');
-    const socket = io(SOCKET_URL, token ? { auth: { token } } : undefined);
+    const token = manager ? null : localStorage.getItem('token');
+    const socket = io(SOCKET_URL, manager ? {auth:{mssGrant:manager.grant,channelName}} : token ? { auth: { token } } : undefined);
     socketRef.current = socket;
 
     const invalidSession = () => {
+      if(manager){playbackCap.current='';socket.auth={};manager.onAuthorizationLost();return;}
       expireSession(token);
       // Public playback can be retried anonymously; never redirect capability failures.
       socket.auth = {};
@@ -65,6 +72,7 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
       const channelStats = channelName ? data.streams?.[channelName] : undefined;
       // Channel-room packets are not global snapshots: absence is not offline.
       if (!channelStats) return;
+      if(manager&&!channelStats.isPublishing)setPreviewMuted(true);
       setViewers(channelStats.viewers || 0);
       setStream(previous => previous && previous.isLive !== channelStats.isPublishing
         ? { ...previous, isLive: !!channelStats.isPublishing } : previous);
@@ -78,19 +86,42 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [channelName]);
+  // Delegated callbacks are deliberately not connection identity; the grant is.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channelName,!!manager]);
+
+  useEffect(()=>{
+    if(!manager||managerGrantRef.current===manager.grant){managerGrantRef.current=manager?.grant;return;}
+    managerGrantRef.current=manager.grant;const socket=socketRef.current;if(!socket)return;const grant=manager.grant,request=++refreshGeneration.current;let pending=true;
+    const fail=()=>{if(!pending||request!==refreshGeneration.current||socketRef.current!==socket)return;pending=false;refreshGeneration.current++;playbackCap.current='';socket.auth={};playbackRef.current?.();playbackRef.current=null;socket.emit('leave_channel');manager.onAuthorizationLost()};
+    const deadline=setTimeout(fail,8000);const disconnected=()=>fail();socket.on('disconnect',disconnected);
+    socket.emit('refresh_delegation',{grant:manager.grant},(response:{ok:boolean;cap?:string})=>{
+      if(!pending||request!==refreshGeneration.current||socketRef.current!==socket)return;
+      if(!response?.ok||!response.cap){clearTimeout(deadline);fail();return;}
+      pending=false;clearTimeout(deadline);socket.off('disconnect',disconnected);
+      playbackCap.current=response.cap;
+      socket.auth={mssGrant:grant,channelName};
+      playbackRef.current?.refresh();
+      manager.onGrantRefreshed(grant);
+    });
+    return()=>{pending=false;clearTimeout(deadline);socket.off('disconnect',disconnected)};
+  // Grant identity alone drives this exchange; callback object identity is UI state.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[manager?.grant,channelName]);
 
   useEffect(() => {
-    if (isAuthorized && videoRef.current && channelName && stream?.isLive) {
-      const playback = startLivePlayback(videoRef.current, () => `${MEDIA_BASE_URL}/live/${channelName}.flv${playbackCap.current ? `?cap=${encodeURIComponent(playbackCap.current)}` : ''}`, setPlaybackSuspended, videoOnly ? message => {
+    if (isAuthorized && (!manager || manager.watching) && videoRef.current && channelName && stream?.isLive) {
+      const playback = startLivePlayback(videoRef.current, () => manager?`${MEDIA_BASE_URL}/mss-live/${channelName}.flv`:`${MEDIA_BASE_URL}/live/${channelName}.flv${playbackCap.current ? `?cap=${encodeURIComponent(playbackCap.current)}` : ''}`, setPlaybackSuspended, (videoOnly||manager) ? message => {
         setError(message);
         setIsAuthorized(false);
         setJoinUsername(null);
-      } : undefined);
+        manager?.onAuthorizationLost();
+      } : undefined,manager?()=>({'X-MSS-Playback':playbackCap.current}):undefined);
       playbackRef.current = playback;
       return () => { playback(); playbackRef.current = null; };
     }
-  }, [isAuthorized, channelName, stream?.isLive, videoOnly]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthorized, channelName, stream?.isLive, videoOnly,manager?.watching]);
 
   useEffect(() => {
     const socket = socketRef.current;
@@ -116,10 +147,12 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
         generation++;
         clearTimeout(renewal);
         playbackCap.current = '';
+        if(manager)socket.auth = {};
         joined = false;
         setIsAuthorized(false);
         setError('Joining timed out. Please try again.');
         setJoinUsername(null);
+        manager?.onAuthorizationLost();
       };
       const connectionFailed = (error?: Error & { data?: { status?: number } }) => {
         expire();
@@ -131,6 +164,7 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
         deadline = setTimeout(expire, 10000);
       };
       const disconnected = () => {
+        if(manager)setPreviewMuted(true);
         generation++;
         clearTimeout(renewal);
         playbackCap.current = '';
@@ -143,14 +177,15 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
         armDeadline();
         joined = false;
         setIsAuthorized(false);
-        socket.emit('join_channel', { channelName, username: joinUsername, password: joinPassword.current }, (response: { ok: boolean; error?: string; cap?: string }) => {
+        socket.emit('join_channel', { channelName, username: joinUsername, password: joinPassword.current }, (response: { ok: boolean; error?: string; cap?: string; credentials?: {server?:string;streamKey?:string} }) => {
           if (!active || request !== generation || socketRef.current !== socket) return;
           clearTimeout(deadline);
-          joined = response?.ok === true && (!videoOnly || !!response.cap);
+          joined = response?.ok === true && (!(videoOnly || manager) || !!response.cap);
           playbackCap.current = joined ? response.cap || '' : '';
           clearTimeout(renewal);
           if (joined && response.cap) renewal = setTimeout(renew, 60000);
           setIsAuthorized(joined);
+          manager?.onAdmission(joined,response);
           if (!joined) {
             setError(response?.error || (videoOnly ? 'Playback admission failed. Please retry.' : 'This username is already taken in this channel'));
             setJoinUsername(null);
@@ -161,9 +196,9 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
         });
       };
       const kicked = () => {
-        if (videoOnly) {
+        if (videoOnly || manager) {
           expire();
-          setError('You have been removed from this stream.');
+          setError('You have been removed from this stream.');manager?.onAuthorizationLost();
           return;
         }
         alert('You have been kicked from this stream by an administrator.');
@@ -193,8 +228,8 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
         socket.emit('leave_channel');
       };
     }
-  }, [joinUsername, channelName, videoOnly]);
-
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joinUsername, channelName, videoOnly,!!manager]);
 
 
   const handleJoin = () => {
@@ -227,6 +262,14 @@ const PlayerSession = ({ videoOnly = false }: PlayerProps) => {
   const onEmojiClick = (emojiData: { emoji: string }) => {
     setNewMessage(prev => prev + emojiData.emoji);
   };
+
+  if(manager){
+    return <main className="mss-manager-player">
+      <header style={{display:'flex',flexWrap:'wrap',gap:8,justifyContent:'space-between',alignItems:'center',padding:'8px 12px',minWidth:0}}><span style={{minWidth:0,overflowWrap:'anywhere'}}>Signed in as {manager.displayName}</span><div style={{display:'flex',gap:8,flexWrap:'wrap'}}>{!manager.watching?<Button label="Return to preview" disabled={!isAuthorized} onClick={()=>{setPreviewMuted(true);manager.onWatch()}} style={{minHeight:44}}/>:<Button label={previewMuted?'Unmute':'Mute'} disabled={!isAuthorized||!stream?.isLive} onClick={()=>setPreviewMuted(value=>!value)} style={{minHeight:44}}/>}</div></header>
+      <section aria-label="Video preview" className="mss-manager-video">{manager.watching&&isAuthorized&&stream?.isLive?<video ref={videoRef} aria-label="Live stream" muted={previewMuted} playsInline style={{width:'100%',height:'100%',objectFit:'contain'}}/>:<span role="status">{!isAuthorized?'Connecting preview…':!stream?.isLive?'Stream offline. Preview resumes automatically.':!manager.watching?'Library audio selected. Return to preview to switch.':'Preparing preview…'}</span>}</section>
+      <section aria-label="Chat" className="mss-manager-chat"><ChatMessages messages={messages} username={manager.displayName}/><form onSubmit={event=>{event.preventDefault();sendMessage()}} style={{display:'flex',flexWrap:'wrap',gap:8,padding:8,minWidth:0}}><InputText aria-label="Message" value={newMessage} onChange={event=>setNewMessage(event.target.value)} maxLength={500} style={{flex:'1 1 10rem',minWidth:0,minHeight:44}}/><Button type="submit" label="Send" style={{minHeight:44}}/></form></section>
+    </main>;
+  }
 
   if (videoOnly) {
     const message = !stream ? (error || 'Loading stream…')

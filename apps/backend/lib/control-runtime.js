@@ -39,10 +39,15 @@ function chatAllowed(socket, channel, message, now=Date.now()) {
  if(bucket.count>=5) return false;
  bucket.count++; return true;
 }
+function chatIdentity(socket) {
+ const delegated=socket.data.mssIdentity;
+ return delegated ? {displayName:delegated.displayName,identityType:'mss-artist',verified:true,issuer:delegated.issuer,artistId:delegated.artistId}
+  : {displayName:socket.data.username,identityType:'viewer',verified:false};
+}
 function serialCollector(collect, interval=2000, onError=console.error) {
  let pending=null, stopped=false;
  const tick=()=>{if(stopped || pending) return Promise.resolve(); pending=Promise.resolve().then(collect).catch(onError).finally(()=>{pending=null;});return pending;};
  const timer=setInterval(tick,interval); timer.unref?.();
  return {tick,async stop(){stopped=true;clearInterval(timer);await pending;}};
 }
-module.exports = {pageQuery, scopedStats, Membership, chatAllowed, serialCollector};
+module.exports = {pageQuery, scopedStats, Membership, chatAllowed, chatIdentity, serialCollector};

@@ -50,3 +50,8 @@ test('slow orphan recovery cannot block media readiness or trigger supervisor st
  const w=await worker(recover);
  try{expect(w.process.send).toHaveBeenCalledWith({type:'ready'},expect.any(Function));expect(recover).toHaveBeenCalledTimes(1);}finally{release?.();await flush();}
 });
+test('delegated HTTP sessions retain a dedicated auth path but attach to the ordinary live broadcast',()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../lib/media-worker.js'),'utf8');
+ expect(source).toContain("this.streamApp==='mss-live'");
+ expect(source).toContain('context.broadcasts.get(`/live/${this.streamName}`)');
+});
