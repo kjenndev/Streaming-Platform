@@ -13,10 +13,11 @@ const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 if (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) require('./tests/test-env');
 else require('dotenv').config({quiet:true});
-const {pageQuery,scopedStats,Membership,chatAllowed,serialCollector}=require('./lib/control-runtime');
+const {pageQuery,scopedStats,Membership,chatAllowed,chatIdentity,serialCollector}=require('./lib/control-runtime');
 const {processTelemetry}=require('./lib/process-runtime');
 const {superviseMedia}=require('./lib/media-supervisor');
 const playback=require('./lib/playback-auth');
+const mssDelegation=require('./lib/mss-delegation').createMssDelegation({env:process.env});
 
 const {createRecordingRecovery}=require('./lib/recording-recovery');
 const recordingsRoot=path.resolve(process.env.RECORDINGS_ROOT || path.join(__dirname,'recordings'));
@@ -135,6 +136,11 @@ const loginLimiter = rateLimit({
 // Socket.io Auth Middleware
 io.use(async (socket, next) => {
   const token = socket.handshake.auth.token;
+  const delegatedGrant=socket.handshake.auth.mssGrant,delegatedChannel=socket.handshake.auth.channelName;
+  if(delegatedGrant || delegatedChannel){
+    try{const identity=await mssDelegation.authorize(delegatedGrant,delegatedChannel);socket.data.roles=[];socket.data.isAnonymous=false;socket.data.mssGrant=delegatedGrant;socket.data.mssIdentity=identity;return next();}
+    catch{return next(Object.assign(new Error('Delegated session denied'),{data:{status:401,code:'DELEGATION_DENIED'}}));}
+  }
   if (!token) {
     socket.data.roles = [];
     socket.data.isAnonymous = true;
@@ -366,6 +372,15 @@ app.post('/api/public/streams/:channelName/playback',playbackLimiter,async(req,r
  if(!admission.ok)return passwordDenied(res,admission);
  res.set('Cache-Control','no-store');
  res.json({cap:playback.issue(stream,{purpose,user:authorized?user:undefined}),expiresIn:playback.TTL});
+});
+app.get('/api/integrations/mss/config',(req,res)=>res.json(mssDelegation.publicConfig()));
+app.post('/api/integrations/mss/session',async(req,res)=>{
+ try{
+  const identity=await mssDelegation.authorize(req.body?.grant,req.body?.channelName);
+  const stream=await prisma.stream.findUnique({where:{channelName:identity.channel},select:{id:true,channelName:true,streamKey:true,isDisabled:true,isLive:true}});
+  if(!stream || stream.isDisabled)return res.status(403).json({error:'Delegated channel unavailable'});
+  res.set('Cache-Control','private, no-store').json({channelName:stream.channelName,isLive:stream.isLive,displayName:identity.displayName});
+ }catch{return res.status(403).json({error:'Delegated access denied'});}
 });
 app.get('/api/metrics',authenticateUser,requireAdmin,(req,res)=>res.json({api:apiMetrics,media:latest.media}));
 app.get('/api/streams/:id/viewers',authenticateUser,authorizedStream,(req,res)=>{
@@ -633,41 +648,58 @@ io.on('connection',socket=>{
  let joinGeneration=0;
  socket.on('join_channel',async(input={},callback)=>{input=input || {};
   const generation=++joinGeneration;
-  let ok=false,cap,admission;
-  if(valid(input.channelName,input.username) && socketSessionActive(socket)){
+  let ok=false,cap,admission,delegatedCredentials;
+  const delegated=socket.data.mssIdentity;
+  if(((delegated && input.channelName===delegated.channel) || (!delegated && valid(input.channelName,input.username))) && socketSessionActive(socket)){
    try{
+    if(delegated)socket.data.mssIdentity=await mssDelegation.authorize(socket.data.mssGrant,delegated.channel);
     const stream=await prisma.stream.findUnique({where:{channelName:input.channelName},include:playback.streamInclude});
     const user=socket.data.userId?await prisma.user.findUnique({where:{id:socket.data.userId}}):null;
     const authorized=playback.assigned(stream || {},user);
-    admission=await passwordAdmission(stream,authorized,input.password,socket.request.socket.remoteAddress);
+    admission=delegated?{ok:!!stream&&!stream.isDisabled}:await passwordAdmission(stream,authorized,input.password,socket.request.socket.remoteAddress);
     if(admission.ok && (!socket.data.userId || user?.roles.length) && generation===joinGeneration && socket.connected){
-     cap=playback.issue(stream,{user:authorized?user:undefined});
-     membership.join(socket,input.channelName,input.username);
+     cap=delegated?playback.issue(stream,{purpose:'delegated-live',delegation:{grant:socket.data.mssGrant,...socket.data.mssIdentity}}):playback.issue(stream,{user:authorized?user:undefined});
+     membership.join(socket,input.channelName,delegated?socket.data.mssIdentity.displayName:input.username);
      socket.data.membershipCap=playback.issue(stream,{purpose:'membership',user:authorized?user:undefined});
      socket.data.playbackChannel=stream.channelName;ok=true;
+     if(delegated)delegatedCredentials={server:mssDelegation.ingestUrl(),streamKey:`${encodeURIComponent(stream.channelName)}?key=${encodeURIComponent(stream.streamKey)}`};
     }
    }catch{}
   }
-  if(typeof callback==='function')callback(ok?{ok:true,cap,expiresIn:playback.TTL}:{ok:false,error:'Invalid password, channel or unavailable username',...(admission?.code?{code:admission.code,retryAfter:admission.retryAfter,status:admission.status}:{})});
+  if(typeof callback==='function')callback(ok?{ok:true,cap,expiresIn:playback.TTL,...(delegated?{credentials:delegatedCredentials}:{})}:{ok:false,error:'Invalid password, channel or unavailable username',...(admission?.code?{code:admission.code,retryAfter:admission.retryAfter,status:admission.status}:{})});
  });
  socket.on('renew_playback',async(_input,callback)=>{
   let response={ok:false};
   try{
    const channel=socket.data.playbackChannel;
    if(channel && socketSessionActive(socket)){
+    if(socket.data.mssIdentity)socket.data.mssIdentity=await mssDelegation.authorize(socket.data.mssGrant,channel);
     const stream=await prisma.stream.findUnique({where:{channelName:channel},include:playback.streamInclude});
     if(await playback.allowed(stream,socket.data.membershipCap,'membership',{db:prisma,ignoreExpiration:true}) && socket.connected && socket.data.playbackChannel===channel){
      const claims=playback.decode(socket.data.membershipCap,'membership',true);
      const user=claims.actor?await prisma.user.findUnique({where:{id:claims.actor}}):undefined;
-     response={ok:true,cap:playback.issue(stream,{user}),expiresIn:playback.TTL};
+     response={ok:true,cap:socket.data.mssIdentity?playback.issue(stream,{purpose:'delegated-live',delegation:{grant:socket.data.mssGrant,...socket.data.mssIdentity}}):playback.issue(stream,{user}),expiresIn:playback.TTL};
     }
+   }
+  }catch{}
+  if(typeof callback==='function')callback(response);
+ });
+ socket.on('refresh_delegation',async(input={},callback)=>{
+  let response={ok:false};
+  try{
+   const channel=socket.data.playbackChannel;
+   const current=socket.data.mssIdentity;
+   if(current&&channel&&typeof input.grant==='string'&&socketSessionActive(socket)){
+    const identity=await mssDelegation.authorize(input.grant,channel);
+    const stream=await prisma.stream.findUnique({where:{channelName:channel},include:playback.streamInclude});
+    if(identity.issuer===current.issuer&&identity.artistId===current.artistId&&identity.sessionId===current.sessionId&&stream&&!stream.isDisabled&&socket.connected&&socket.data.playbackChannel===channel){socket.data.mssGrant=input.grant;socket.data.mssIdentity=identity;response={ok:true,cap:playback.issue(stream,{purpose:'delegated-live',delegation:{grant:input.grant,...identity}}),expiresIn:playback.TTL};}
    }
   }catch{}
   if(typeof callback==='function')callback(response);
  });
  socket.on('send_message',(input={},callback)=>{input=input || {};
   const ok=socketSessionActive(socket) && chatAllowed(socket,input.channelName,input.message);
-  if(ok)io.to(`channel:${input.channelName}`).emit('receive_message',{username:socket.data.username,message:input.message,time:Date.now()});
+  if(ok)io.to(`channel:${input.channelName}`).emit('receive_message',{username:socket.data.username,identity:chatIdentity(socket),message:input.message,time:Date.now()});
   if(typeof callback==='function')callback({ok});
  });
  socket.on('leave_channel',()=>{joinGeneration++;membership.leave(socket);delete socket.data.membershipCap;delete socket.data.playbackChannel;});
@@ -708,6 +740,7 @@ async function revalidateSockets(){
    if(!user?.roles.includes('ADMIN'))socket.leave('dashboard');
    const channel=socket.data.playbackChannel;
    if(channel){
+    if(socket.data.mssIdentity)socket.data.mssIdentity=await mssDelegation.authorize(socket.data.mssGrant,channel);
     if(!streams.has(channel))streams.set(channel,prisma.stream.findUnique({where:{channelName:channel},include:playback.streamInclude}));
     if(!await playback.allowed(await streams.get(channel),socket.data.membershipCap,'membership',{db,ignoreExpiration:true}))socket.disconnect(true);
    }

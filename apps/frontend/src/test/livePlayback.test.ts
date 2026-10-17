@@ -25,6 +25,24 @@ it('bounds live buffers and coalesces error retries, disposing timers and listen
   expect(vi.getTimerCount()).toBe(0);
 });
 
+it('passes delegated playback headers through the flv.js configuration argument', () => {
+  const player = { attachMediaElement: vi.fn(), load: vi.fn(), play: vi.fn().mockResolvedValue(undefined), destroy: vi.fn(), off: vi.fn(), on: vi.fn() };
+  vi.mocked(flvjs.createPlayer).mockReturnValue(player as unknown as flvjs.Player);
+  const dispose = startLivePlayback(document.createElement('video'), '/mss-live/mapped.flv', undefined, undefined, () => ({ 'X-MSS-Playback': 'current-cap' }));
+  expect(flvjs.createPlayer).toHaveBeenCalledWith(
+    expect.not.objectContaining({ headers: expect.anything() }),
+    expect.objectContaining({ headers: { 'X-MSS-Playback': 'current-cap' } }),
+  );
+  dispose();
+});
+
+it('reconnects the existing media element with the current delegated header on refresh', () => {
+  let cap='old';const players: ReturnType<typeof vi.fn>[]=[];
+  vi.mocked(flvjs.createPlayer).mockImplementation(()=>{const destroy=vi.fn();players.push(destroy);return {attachMediaElement:vi.fn(),load:vi.fn(),play:vi.fn().mockResolvedValue(undefined),destroy,off:vi.fn(),on:vi.fn()} as unknown as flvjs.Player});
+  const playback=startLivePlayback(document.createElement('video'),'/mss-live/mapped.flv',undefined,undefined,()=>({'X-MSS-Playback':cap}));cap='new';playback.refresh();
+  expect(players[0]).toHaveBeenCalledTimes(1);expect(flvjs.createPlayer).toHaveBeenLastCalledWith(expect.anything(),expect.objectContaining({headers:{'X-MSS-Playback':'new'}}));playback();
+});
+
 it('cancels a pending retry when unmounted and recovers a lagged live edge', () => {
   vi.useFakeTimers();
   let error: () => void = () => {};

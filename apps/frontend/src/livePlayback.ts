@@ -1,7 +1,7 @@
 import flvjs from 'flv.js';
 
 // One recovery timer per mount; never reset the budget on a transient success.
-export function startLivePlayback(video: HTMLVideoElement, url: string | (() => string), onSuspended?: (suspended: boolean) => void, onError?: (message: string) => void) {
+export function startLivePlayback(video: HTMLVideoElement, url: string | (() => string), onSuspended?: (suspended: boolean) => void, onError?: (message: string) => void, headers?: () => Record<string,string>) {
   let player: flvjs.Player | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
@@ -39,6 +39,7 @@ export function startLivePlayback(video: HTMLVideoElement, url: string | (() => 
       autoCleanupMinBackwardDuration: 10,
       enableStashBuffer: false,
       lazyLoad: false,
+      ...(headers ? { headers: headers() } : {}),
     });
     player.on(flvjs.Events.ERROR, recover);
     player.attachMediaElement(video);
@@ -83,5 +84,10 @@ export function startLivePlayback(video: HTMLVideoElement, url: string | (() => 
     release();
   };
   dispose.resume = resume;
+  dispose.refresh = () => {
+    if (disposed || suspended) return;
+    release();
+    create();
+  };
   return dispose;
 }

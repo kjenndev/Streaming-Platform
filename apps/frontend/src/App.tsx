@@ -7,6 +7,7 @@ import Player from './pages/Player';
 import UserManagement from './pages/UserManagement';
 import AppSettings from './pages/AppSettings';
 import SharePlayer from './pages/SharePlayer';
+import MssManager from './pages/MssManager';
 import StreamEditor from './pages/StreamEditor';
 import { ConfirmDialog } from 'primereact/confirmdialog';
 
@@ -58,6 +59,7 @@ function App() {
           } 
         />
         <Route path="/embed/:channelName" element={<Player videoOnly />} />
+        <Route path="/mss-manager" element={<MssManager />} />
         <Route path="/watch/:channelName" element={<Player />} />
         <Route path="/share/:id" element={<SharePlayer />} />
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
