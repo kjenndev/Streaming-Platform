@@ -20,7 +20,7 @@ A modern, responsive dashboard and web player for the RTMP streaming platform. B
 ## Getting Started
 
 ### Prerequisites
-- Node.js (v18+)
+- Node.js 22.12+
 - Backend server running on port 3000
 
 ### Installation
@@ -34,7 +34,7 @@ A modern, responsive dashboard and web player for the RTMP streaming platform. B
    ```
 
 ### Production Build
-To build the application for production, you must set the environment variables to point to your production backend.
+Same-origin production deployments use the frontend origin by default. Set endpoint variables when the API, media server, Socket.IO server, or RTMP ingest host is separate.
 
 1. Create a `.env.production` file or set them in your shell:
    ```env

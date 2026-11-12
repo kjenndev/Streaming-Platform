@@ -129,10 +129,11 @@ for its OBS **Server URL**:
 
 The **Web Player Link** always uses the current frontend origin, preserving its
 HTTP/HTTPS scheme and web port, just like **Watch Channel**. An ingest hostname
-must not replace the player hostname. Stream keys and playback/API/socket
-configuration are unchanged. `VITE_API_URL`, `VITE_MEDIA_URL` and `VITE_SOCKET_URL`
-still need their existing production configuration; this dialog fix does not
-change their localhost defaults. The editor's legacy fallback (when no
+must not replace the player hostname. Stream keys are unchanged. Development keeps the localhost API/socket
+(`http://localhost:3000`) and media (`http://localhost:8000`) defaults. Production
+builds default API/socket traffic to the frontend origin and media traffic to
+`<origin>/media`; `VITE_API_URL`, `VITE_MEDIA_URL` and `VITE_SOCKET_URL` still
+override those defaults for split-origin deployments. The editor's legacy fallback (when no
 `VITE_RTMP_INGEST` is supplied) is unchanged; set that variable for a consistent
 explicit ingest URL in both screens.
 
