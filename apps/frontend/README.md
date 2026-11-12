@@ -7,7 +7,7 @@ A modern, responsive dashboard and web player for the RTMP streaming platform. B
 - **TypeScript**: Static typing for reliability.
 - **PrimeReact**: Professional UI component library.
 - **Chart.js**: Real-time throughput and system monitoring graphs.
-- **flv.js**: Low-latency browser decoding for HTTP-FLV streams.
+- **flv.js / mpegts.js**: HTTP-FLV playback on MediaSource / ManagedMediaSource-only browsers; see [mobile playback](../../docs/mobile-playback.md).
 - **Emoji-Picker-React**: Integrated chat emoji support.
 
 ## Key Modules
