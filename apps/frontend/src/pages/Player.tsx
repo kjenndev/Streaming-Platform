@@ -111,12 +111,12 @@ export const PlayerSession = ({ videoOnly = false, manager }: PlayerProps) => {
 
   useEffect(() => {
     if (isAuthorized && (!manager || manager.watching) && videoRef.current && channelName && stream?.isLive) {
-      const playback = startLivePlayback(videoRef.current, () => manager?`${MEDIA_BASE_URL}/mss-live/${channelName}.flv`:`${MEDIA_BASE_URL}/live/${channelName}.flv${playbackCap.current ? `?cap=${encodeURIComponent(playbackCap.current)}` : ''}`, setPlaybackSuspended, (videoOnly||manager) ? message => {
+      const playback = startLivePlayback(videoRef.current, () => manager?`${MEDIA_BASE_URL}/mss-live/${channelName}.flv`:`${MEDIA_BASE_URL}/live/${channelName}.flv${playbackCap.current ? `?cap=${encodeURIComponent(playbackCap.current)}` : ''}`, setPlaybackSuspended, message => {
         setError(message);
         setIsAuthorized(false);
         setJoinUsername(null);
         manager?.onAuthorizationLost();
-      } : undefined,manager?()=>({'X-MSS-Playback':playbackCap.current}):undefined);
+      },manager?()=>({'X-MSS-Playback':playbackCap.current}):undefined);
       playbackRef.current = playback;
       return () => { playback(); playbackRef.current = null; };
     }

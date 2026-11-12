@@ -4,10 +4,10 @@ import { Link, MemoryRouter, Route, Routes } from 'react-router-dom';
 import axios from 'axios';
 import Player from '../pages/Player';
 import { io } from 'socket.io-client';
-const mocks = vi.hoisted(() => ({ url: undefined as undefined | string | (() => string), handlers: new Map<string, (...args: unknown[]) => void>(), dispose: Object.assign(vi.fn(), { resume: vi.fn() }), suspended: undefined as undefined | ((value: boolean) => void), connected: true, connect: vi.fn(), disconnect: vi.fn(), off: vi.fn(), emit: vi.fn() }));
+const mocks = vi.hoisted(() => ({ error: undefined as undefined | ((message: string) => void), url: undefined as undefined | string | (() => string), handlers: new Map<string, (...args: unknown[]) => void>(), dispose: Object.assign(vi.fn(), { resume: vi.fn() }), suspended: undefined as undefined | ((value: boolean) => void), connected: true, connect: vi.fn(), disconnect: vi.fn(), off: vi.fn(), emit: vi.fn() }));
 vi.mock('axios');
 vi.mock('emoji-picker-react', () => ({ default: () => null, Theme: { DARK: 'dark' } }));
-vi.mock('../livePlayback', () => ({ startLivePlayback: (_video: HTMLVideoElement, _url: string | (() => string), suspended: (value: boolean) => void) => { mocks.url = _url; mocks.suspended = suspended; return mocks.dispose; } }));
+vi.mock('../livePlayback', () => ({ startLivePlayback: (_video: HTMLVideoElement, _url: string | (() => string), suspended: (value: boolean) => void, error?: (message: string) => void) => { mocks.error = error; mocks.url = _url; mocks.suspended = suspended; return mocks.dispose; } }));
 vi.mock('socket.io-client', () => ({ io: vi.fn(() => ({ get connected() { return mocks.connected; }, connect: mocks.connect, on: (name: string, fn: (...args: unknown[]) => void) => mocks.handlers.set(name, fn), off: mocks.off, disconnect: mocks.disconnect, emit: mocks.emit })) }));
 afterEach(() => { localStorage.clear(); mocks.handlers.clear(); mocks.connected = true; vi.clearAllMocks(); vi.useRealTimers(); });
 it('consumes only its channel stats and removes all owned socket handlers on unmount', async () => {
@@ -258,4 +258,20 @@ it('starts an embed on HTTP origins where randomUUID is unavailable',async()=>{
   fireEvent.click(await screen.findByRole('button',{name:'Watch live'}));
   await waitFor(()=>expect(view.container.querySelector('video')).not.toBeNull());
  } finally { vi.unstubAllGlobals(); }
+});
+
+
+it('ordinary watch exposes unsupported playback and leaves membership instead of a silent black player', async () => {
+ vi.mocked(axios.get).mockResolvedValue({data:{isLive:true}});
+ mocks.emit.mockImplementation((name,_payload,ack)=>{if(name==='join_channel')ack({ok:true,cap:'fixture'});});
+ render(<MemoryRouter initialEntries={['/watch/mine']}><Routes><Route path="/watch/:channelName" element={<Player />} /></Routes></MemoryRouter>);
+ fireEvent.change(await screen.findByPlaceholderText('Choose a name'),{target:{value:'alice'}});
+ fireEvent.click(screen.getByText('Join Stream'));
+ await screen.findByRole('log');
+ expect(mocks.error).toBeTypeOf('function');
+ act(()=>mocks.error!('Live video format is unsupported. Update your browser or ask the broadcaster to use H.264/AAC.'));
+ expect(await screen.findByText(/Live video format is unsupported/)).toBeInTheDocument();
+ expect(mocks.dispose).toHaveBeenCalled();
+ expect(mocks.emit).toHaveBeenCalledWith('leave_channel');
+ expect(screen.getByText('Join Stream')).toBeInTheDocument();
 });

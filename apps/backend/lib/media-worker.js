@@ -120,7 +120,7 @@ async function revalidatePlayback(){
  const db={stream:{findUnique:a=>memo('stream',a)},user:{findUnique:a=>memo('user',a)}};
  const viewers=[...context.sessions.values()].filter(s=>s.playbackAdmitted);
  await playback.deadline(Promise.all(viewers.map(async s=>{
-  try{if(!await require('./media-playback-auth').createMediaPlaybackAuthorizer({db,delegation})(s,false))s.close();}catch{s.close();}
+  try{if(!await require('./media-playback-auth').createMediaPlaybackAuthorizer({db,delegation})(s,true))s.close();}catch{s.close();}
  }))).catch(()=>{for(const s of viewers)s.close();});
 }
 async function snapshot(){

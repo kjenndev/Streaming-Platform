@@ -123,17 +123,18 @@ it('cancels a pending network recovery when paused and ignores old autoplay reje
  expect(vi.getTimerCount()).toBe(0);
 });
 
-it('keeps replacement playback active after real flv destroy queues a native pause, then honors user pause', async () => {
+it.each([true, false])('keeps replacement playback active and honors user pause when teardown delivers pause=%s', async deliverTeardownPause => {
  vi.useFakeTimers();
  const actual = await vi.importActual<typeof import('flv.js')>('flv.js');
  const video = document.createElement('video');
  let paused = true;
+ let pauseCount = 0;
  Object.defineProperty(video, 'paused', {get: () => paused});
  video.play = vi.fn(async () => { paused = false; });
  video.pause = vi.fn(() => {
   if (paused) return;
   paused = true;
-  setTimeout(() => video.dispatchEvent(new Event('pause')), 0);
+  if (++pauseCount !== 1 || deliverTeardownPause) setTimeout(() => video.dispatchEvent(new Event('pause')), 0);
  });
  const players: flvjs.Player[] = [];
  vi.mocked(flvjs.createPlayer).mockImplementation((source, config) => {
@@ -170,7 +171,7 @@ it('reports unsupported playback and exhausted recovery to an optional embed err
  const failed=vi.fn();
  vi.mocked(flvjs.isSupported).mockReturnValueOnce(false);
  const unsupported=startLivePlayback(document.createElement('video'),'/fixture.flv',undefined,failed);
- expect(failed).toHaveBeenCalledWith('Live playback is not supported in this browser.');
+ expect(failed).toHaveBeenCalledWith(expect.stringContaining('Live playback is not supported in this browser.'));
  unsupported();failed.mockClear();vi.useFakeTimers();
  let error:()=>void=()=>{};
  vi.mocked(flvjs.createPlayer).mockImplementation(()=>({attachMediaElement:vi.fn(),load:vi.fn(),play:vi.fn().mockResolvedValue(undefined),destroy:vi.fn(),off:vi.fn(),on:vi.fn((_event,handler)=>{error=handler;})}) as unknown as flvjs.Player);
@@ -178,4 +179,22 @@ it('reports unsupported playback and exhausted recovery to an optional embed err
  for(let i=0;i<4;i++){error();vi.advanceTimersByTime(10000);}
  expect(failed).toHaveBeenCalledWith('Live playback failed. Please retry.');
  dispose();
+});
+
+
+it('turns synchronous attachment failure into a safe actionable error and destroys partial player',()=>{
+ const destroy=vi.fn(), failed=vi.fn();
+ vi.mocked(flvjs.createPlayer).mockReturnValue({on:vi.fn(),off:vi.fn(),destroy,attachMediaElement:()=>{throw new Error('secret-url');}} as unknown as flvjs.Player);
+ const dispose=startLivePlayback(document.createElement('video'),'/fixture.flv',undefined,failed);
+ expect(failed).toHaveBeenCalledWith(expect.stringMatching(/Update.*browser.*H\.264.*AAC/));
+ expect(destroy).toHaveBeenCalledOnce();dispose();
+});
+it.each(['FormatUnsupported','CodecUnsupported'])('reports %s without futile retries or raw error details',detail=>{
+ vi.useFakeTimers();let error:(type:string,detail:string,info:unknown)=>void=()=>{};
+ const destroy=vi.fn(),failed=vi.fn();
+ vi.mocked(flvjs.createPlayer).mockReturnValue({on:(_event:string,handler:typeof error)=>{error=handler;},off:vi.fn(),destroy,attachMediaElement:vi.fn(),load:vi.fn(),play:vi.fn().mockResolvedValue(undefined)} as unknown as flvjs.Player);
+ const dispose=startLivePlayback(document.createElement('video'),'/fixture.flv',undefined,failed);
+ error('MediaError',detail,{message:'secret-url'});
+ expect(failed).toHaveBeenCalledWith(expect.stringMatching(/format.*unsupported.*H\.264.*AAC/));
+ expect(destroy).toHaveBeenCalledOnce();expect(vi.getTimerCount()).toBe(0);dispose();
 });
